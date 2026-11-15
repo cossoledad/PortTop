@@ -5,31 +5,34 @@ CPPFLAGS += -D_GNU_SOURCE -Isrc $(CURSES_CFLAGS)
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Wformat=2 -Wshadow -Wconversion
 LDFLAGS ?=
-PREFIX ?= /usr/local
-SOURCES = src/main.c src/proc.c src/actions.c src/ui.c
-OBJECTS = $(SOURCES:src/%.c=build/%.o)
+PREFIX ?= $(HOME)/.local
+BUILD_DIR ?= build
+SOURCES = src/main.c src/proc.c src/actions.c src/history.c src/ui.c
+OBJECTS = $(SOURCES:src/%.c=$(BUILD_DIR)/%.o)
 
-.PHONY: all clean test sanitize install uninstall
-all: build/porttop
-build:
+.PHONY: all clean test test-install sanitize install uninstall
+all: $(BUILD_DIR)/porttop
+$(BUILD_DIR):
 	mkdir -p $@
-build/%.o: src/%.c src/porttop.h | build
+$(BUILD_DIR)/%.o: src/%.c src/porttop.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
-build/porttop: $(OBJECTS)
+$(BUILD_DIR)/porttop: $(OBJECTS)
 	$(CC) $(LDFLAGS) $^ $(CURSES_LIBS) -o $@
-build/test-core: tests/core.c build/proc.o build/actions.o src/porttop.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/core.c build/proc.o build/actions.o -o $@
-test: all build/test-core
-	./build/test-core
-	python3 tests/integration.py ./build/porttop
+$(BUILD_DIR)/test-core: tests/core.c $(BUILD_DIR)/proc.o $(BUILD_DIR)/actions.o $(BUILD_DIR)/history.o src/porttop.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/core.c $(BUILD_DIR)/proc.o $(BUILD_DIR)/actions.o $(BUILD_DIR)/history.o -o $@
+test: all $(BUILD_DIR)/test-core
+	./$(BUILD_DIR)/test-core
+	python3 tests/integration.py ./$(BUILD_DIR)/porttop
+test-install:
+	python3 tests/install.py
 sanitize:
 	$(MAKE) clean
 	$(MAKE) CFLAGS='-O1 -g -std=c11 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined'
 	ASAN_OPTIONS=detect_leaks=1 $(MAKE) CFLAGS='-O1 -g -std=c11 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined' test
 install: all
-	install -Dm755 build/porttop $(DESTDIR)$(PREFIX)/bin/porttop
+	install -Dm755 "$(BUILD_DIR)/porttop" "$(DESTDIR)$(PREFIX)/bin/porttop"
 uninstall:
-	rm -f $(DESTDIR)$(PREFIX)/bin/porttop
+	rm -f "$(DESTDIR)$(PREFIX)/bin/porttop"
 clean:
-	rm -rf build
+	rm -rf "$(BUILD_DIR)"
 -include $(OBJECTS:.o=.d)

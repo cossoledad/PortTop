@@ -12,11 +12,12 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
+#include <wchar.h>
 
 #define MAX_CHAIN 12
 static struct termios saved;
 static SCREEN *screen;
-static bool active,colors;
+static bool active,colors,unicode,dimmed;
 static volatile sig_atomic_t stopping,suspending,resized;
 static int width,height;
 
@@ -41,8 +42,9 @@ static void restore(void) {
 }
 static attr_t style(int color) {
     attr_t a=colors?COLOR_PAIR(color):A_NORMAL;
-    if (color==1 || color==5) a|=A_BOLD;
-    if (color==5 && !colors) a|=A_REVERSE;
+    if (color==1 || color==5 || color==16) a|=A_BOLD;
+    if (dimmed) a|=A_DIM;
+    if ((color==5 || color==13 || color==16) && !colors) a|=A_REVERSE;
     return a;
 }
 static void put(WINDOW *w,int y,int x,int max,int color,const char *fmt,...)
@@ -54,9 +56,35 @@ static void put(WINDOW *w,int y,int x,int max,int color,const char *fmt,...) {
     char text[32768]; va_list ap; va_start(ap,fmt); vsnprintf(text,sizeof(text),fmt,ap); va_end(ap);
     wattrset(w,(int)style(color)); mvwaddnstr(w,y,x,text,max); wattrset(w,A_NORMAL);
 }
-static void rule(int y,const char *title) {
-    attrset((int)style(1)); mvhline(y,1,ACS_HLINE,width-2); attrset(A_NORMAL);
-    put(stdscr,y,2,width-4,1," %s ",title);
+static void glyph(WINDOW *w,int y,int x,wchar_t ch,int color) {
+    if (y<0 || y>=getmaxy(w) || x<0 || x>=getmaxx(w)) return;
+    wchar_t text[2]={ch,0}; cchar_t cell;
+    setcchar(&cell,text,style(color)&~A_COLOR,(short)(colors?color:0),NULL);
+    mvwadd_wch(w,y,x,&cell);
+}
+static void frame(WINDOW *w,int y,int x,int rows,int cols,const char *title,int color) {
+    if (rows<2 || cols<2) return;
+    wchar_t hz=unicode?L'─':L'-',vt=unicode?L'│':L'|';
+    for (int j=1;j<cols-1;j++) { glyph(w,y,x+j,hz,color); glyph(w,y+rows-1,x+j,hz,color); }
+    for (int i=1;i<rows-1;i++) { glyph(w,y+i,x,vt,color); glyph(w,y+i,x+cols-1,vt,color); }
+    glyph(w,y,x,unicode?L'╭':L'+',color); glyph(w,y,x+cols-1,unicode?L'╮':L'+',color);
+    glyph(w,y+rows-1,x,unicode?L'╰':L'+',color); glyph(w,y+rows-1,x+cols-1,unicode?L'╯':L'+',color);
+    put(w,y,x+2,cols-4,color," %s ",title);
+}
+static void clipped(char *out,size_t size,const char *text,int cols) {
+    if (cols<1 || !size) { if (size) *out=0; return; }
+    size_t n=strlen(text),limit=(size_t)cols;
+    if (limit>=size) limit=size-1;
+    if (n<=limit) snprintf(out,size,"%s",text);
+    else if (limit<7) snprintf(out,size,"%.*s",(int)limit,text);
+    else {
+        size_t left=(limit-3)/2,right=limit-3-left;
+        snprintf(out,size,"%.*s...%s",(int)left,text,text+n-right);
+    }
+}
+static void field(int y,const char *label,const char *value,int color) {
+    char text[8192]; clipped(text,sizeof(text),value,width-15);
+    put(stdscr,y,3,8,2,"%s",label); put(stdscr,y,11,width-14,color,"%s",text);
 }
 static const char *sort_name(Sort sort) {
     static const char *names[]={"port","pid","cpu","memory"}; return names[sort];
@@ -68,6 +96,7 @@ static size_t read_chain(const Process *owner,Process *chain) {
         if (process_protected(parent)) break;
         bool seen=false; for (size_t i=0;i<n;i++) if (chain[i].pid==parent) seen=true;
         if (seen || process_read(parent,&chain[n])<0) break;
+        if (!process_visible(&chain[n],geteuid())) break;
         if (chain[n].tty!=0 && chain[n].pid==chain[n].session) break;
         /* Parent could have exited and its PID been reused. */
         if (chain[n].start>chain[n-1].start) break;
@@ -97,7 +126,7 @@ static void port_list(const Snapshot *s,pid_t pid,char *out,size_t size) {
     if (!used) snprintf(out,size,"no visible ports");
 }
 static void draw_dialog(Dialog *d,const Snapshot *s) {
-    int h=height-2; if (h>30) h=30;
+    int h=height-2; if (h>26) h=26;
     int w=width-6; if (w>112) w=112;
     int top=(height-h)/2,left=(width-w)/2;
     if (d->window && (getmaxy(d->window)!=h || getmaxx(d->window)!=w ||
@@ -106,8 +135,7 @@ static void draw_dialog(Dialog *d,const Snapshot *s) {
     }
     if (!d->window) d->window=newwin(h,w,top,left);
     WINDOW *win=d->window; if (!win) return;
-    werase(win); wattrset(win,(int)style(1)); box(win,0,0); wattrset(win,A_NORMAL);
-    put(win,0,3,w-6,1," TERMINATE PROCESS ");
+    werase(win); frame(win,0,0,h,w,"TERMINATE PROCESS",9);
     const Process *target=&d->chain[d->target];
     put(win,1,3,w-6,4,"%s  | origin port %u | target PID %d",d->sig==SIGTERM?"SIGTERM":"SIGKILL",d->port,target->pid);
     put(win,2,3,w-6,2,"Launch chain: Up selects parent, Down selects child");
@@ -143,85 +171,241 @@ static void draw_dialog(Dialog *d,const Snapshot *s) {
     else put(win,h-5,3,w-6,4,"%s",d->tree?"Includes descendants and their other ports. Reviewed PIDs only.":"A supervisor may restart it. Select a parent + Subtree to stop its services.");
     put(win,h-4,3,w-6,2,"Tab/Left/Right: button | Enter: activate | y: confirm | Esc/n: cancel");
     put(win,h-2,w/2-18,16,d->confirm?0:5,"  [ Cancel ]  ");
-    put(win,h-2,w/2+2,18,d->confirm?5:0," [ Terminate ] ");
+    put(win,h-2,w/2+2,18,d->confirm?16:12," [ Terminate ] ");
     /* Overlay the complete virtual popup, then commit the whole frame once. */
     touchwin(win); wnoutrefresh(win);
 }
-static void draw(const Snapshot *s,const Options *o,const size_t *list,size_t count,size_t selected,
-                 size_t *offset,bool paused,bool filtering,bool help,Dialog *dialog,
-                 size_t cmd_offset,const Process *chain,size_t nchain,const char *message) {
-    getmaxyx(stdscr,height,width);
-    /* werase only resets the virtual canvas; it does not clear the terminal. */
-    erase();
-    if (width<80 || height<24) {
-        put(stdscr,0,0,width,1,"PortTop | terminal too small");
-        put(stdscr,2,0,width,0,"Resize to at least 80 columns x 24 rows. q: quit");
-        wnoutrefresh(stdscr); doupdate(); return;
+/* All panel geometry depends only on terminal dimensions, never live data. */
+static int metrics_height(void) { return height>=32?10:7; }
+static int graph_height(void) { return metrics_height()-5; }
+static int cpu_width(void) { return width*2/3; }
+static int core_columns(void) {
+    int n=(cpu_width()-cpu_width()/2-3)/11; return n>0?n:1;
+}
+static int table_begin(void) { return 1+metrics_height()+2; }
+static int detail_begin(void) { return height-2-(height>=32?9:6); }
+static int detail_command_width(void) { return width>15?width-14:1; }
+static size_t cores_per_page(void) { return (size_t)(core_columns()*graph_height()); }
+static double bounded(double v) { return v<0?0:(v>100?100:v); }
+static void graph(const History *h,const ProcessHistory *series,bool memory,int x,int cols,
+                  bool shared_scale,double cpu_axis,uint64_t memory_axis) {
+    int rows=graph_height();
+    size_t n=h->count<(size_t)cols?h->count:(size_t)cols;
+    static const unsigned left_bits[]={1,2,4,64},right_bits[]={8,16,32,128};
+    static const char shades[]=" .:-=+#@";
+    for (size_t j=0;j<n;j++) {
+        size_t slot=(h->next+PT_HISTORY-n+j)%PT_HISTORY;
+        const HostPoint *point=&h->points[slot];
+        int col=x+cols-(int)n+(int)j;
+        double value=bounded(memory?point->memory:point->cpu),overlay=0;
+        bool valid=memory?point->memory_valid:point->cpu_valid,measured=false;
+        if (series && series->points[slot].present) {
+            const ProcessPoint *p=&series->points[slot];
+            measured=memory?(!shared_scale || point->memory_valid):(p->cpu_valid && (!shared_scale || point->cores>0));
+            if (measured) {
+                if (memory) overlay=100.*(double)p->rss/(double)(shared_scale?point->mem_total:memory_axis);
+                else overlay=shared_scale?p->cpu/(double)point->cores:100.*p->cpu/cpu_axis;
+            }
+        }
+        if (unicode) {
+            int fill=valid?(int)(value*(double)(rows*4)/100.+0.5):0;
+            int trace=(int)(bounded(overlay)*(double)(rows*4-1)/100.+0.5);
+            for (int row=0;row<rows;row++) {
+                unsigned bits=0; bool process_pixel=false;
+                for (int pixel=0;pixel<4;pixel++) {
+                    int level=(rows-1-row)*4+(3-pixel);
+                    if (level<fill) bits|=left_bits[pixel];
+                    if (measured && level==trace) { bits|=right_bits[pixel]; process_pixel=true; }
+                }
+                if (bits) glyph(stdscr,3+row,col,(wchar_t)(0x2800+bits),process_pixel?6:(memory?3:1));
+            }
+        } else {
+            int levels=valid?(int)(value*(double)(rows*8)/100.):0;
+            for (int k=0;k<rows;k++) {
+                char ch=levels>=(k+1)*8?'#':(levels>k*8?shades[levels-k*8]:' ');
+                if (!k && valid && ch==' ') ch='.';
+                if (ch!=' ') put(stdscr,3+rows-1-k,col,1,memory?3:1,"%c",ch);
+            }
+            if (measured && (cols-1-(col-x))%2==0) {
+                int level=(int)(bounded(overlay)*(double)(rows-1)/100.+0.5);
+                put(stdscr,3+rows-1-level,col,1,6,"*");
+            }
+        }
     }
-    put(stdscr,0,2,width-4,1,"PORTTOP  v%s",PT_VERSION);
-    put(stdscr,0,21,width-23,2,"ports first, processes in context");
-    rule(1,"SYSTEM");
-    put(stdscr,2,3,width-6,0,"CPU %5.1f%%   RAM %5.1f / %.1f GiB   sockets %5zu   processes %5zu   %s",
-         s->host_cpu,(double)(s->mem_total-s->mem_available)/1073741824.,(double)s->mem_total/1073741824.,s->nsockets,s->nprocesses,paused?"PAUSED":"LIVE");
-    put(stdscr,3,3,width-6,4,"Unknown owners: %zu | inaccessible processes: %zu | unavailable tables: %zu",s->unknown,s->denied,s->unavailable_tables);
-    char title[256]; snprintf(title,sizeof(title),"PORTS / %s / sort: %s %s / %zu rows",o->all?"all sockets":"listeners + UDP",sort_name(o->sort),o->reverse?"reversed":"",count);
-    rule(4,title);
-    put(stdscr,5,2,width-4,2," PORT  PROTO LOCAL ADDRESS             STATE          PID USER        CPU%%  RSS MiB COMMAND");
-    int detail_top=height-13,visible=detail_top-7; if (visible<1) visible=1;
+}
+static void draw_metrics(const Snapshot *s,const History *history,const Process *p,size_t core_page,bool shared_scale) {
+    int split=cpu_width(),rows=metrics_height(),chart_cols=split/2-3;
+    frame(stdscr,1,1,rows,split-1,"CPU HISTORY",7);
+    frame(stdscr,1,split+1,rows,width-split-2,"MEM HISTORY",8);
+    char proc_cpu[32]="--",proc_mem[32]="--";
+    if (p && p->cpu_valid) snprintf(proc_cpu,sizeof(proc_cpu),"%.1f%%",p->cpu);
+    if (p) snprintf(proc_mem,sizeof(proc_mem),"%.1f MiB",(double)p->rss/1048576.);
+    put(stdscr,2,3,chart_cols,0,"TOTAL %5.1f%% | PID %s",s->host_cpu,proc_cpu);
+    uint64_t used=s->mem_available<=s->mem_total?s->mem_total-s->mem_available:0;
+    double mem=s->mem_total?100.*(double)used/(double)s->mem_total:0;
+    put(stdscr,1,width-11,8,3," %5.1f%% ",mem);
+    put(stdscr,2,split+3,width-split-6,0,"%.2f / %.2f GiB",(double)used/1073741824.,(double)s->mem_total/1073741824.);
+    const ProcessHistory *series=p?history_process(history,p->pid,p->start):NULL;
+    double cpu_axis; uint64_t memory_axis;
+    history_scale(history,series,&cpu_axis,&memory_axis);
+    graph(history,series,false,3,chart_cols,shared_scale,cpu_axis,memory_axis);
+    graph(history,series,true,split+3,width-split-6,shared_scale,cpu_axis,memory_axis);
+    size_t per_page=cores_per_page(),pages=(s->ncores+per_page-1)/per_page;
+    size_t first=(pages?core_page%pages:0)*per_page;
+    int columns=core_columns(),core_x=split/2+2;
+    put(stdscr,2,core_x,split-core_x-2,2,"CORES %zu-%zu/%zu [c]",s->ncores?first+1:0,
+        first+per_page<s->ncores?first+per_page:s->ncores,s->ncores);
+    for (size_t j=0;j<per_page && first+j<s->ncores;j++) {
+        const Cpu *cpu=&s->cores[first+j];
+        int y=3+(int)(j/(size_t)columns),x=core_x+(int)(j%(size_t)columns)*11;
+        if (cpu->valid) put(stdscr,y,x,10,cpu->usage>=75?4:3,"c%02u %5.1f%%",cpu->id,cpu->usage);
+        else put(stdscr,y,x,10,2,"c%02u    --%%",cpu->id);
+    }
+    int legend=rows-2;
+    if (p) put(stdscr,legend,3,split-5,6,"* PID %d   %s",p->pid,p->name);
+    else put(stdscr,legend,3,split-5,2,"system average / 0-100%%");
+    if (p && shared_scale) put(stdscr,legend+1,3,split-5,2,"CPU scaled to %zu cores [g]",s->ncores);
+    else if (p) put(stdscr,legend+1,3,split-5,2,"axes: CPU %.0f%%  [g] independent",cpu_axis);
+    else put(stdscr,legend+1,3,split-5,2,"1 column = 1 sample");
+    put(stdscr,legend,split+3,width-split-6,6,"PID %s",proc_mem);
+    if (p && !shared_scale) put(stdscr,legend+1,split+3,width-split-6,2,"RSS axis %.0f MiB",(double)memory_axis/1048576.);
+    else put(stdscr,legend+1,split+3,width-split-6,2,"RSS / total RAM");
+}
+typedef struct { int port,proto,address,state,pid,user,cpu,memory,command,addr_width; bool show_user; } Columns;
+static Columns table_columns(void) {
+    Columns c={.port=3,.show_user=width>=112};
+    c.proto=c.port+6; c.address=c.proto+6; c.addr_width=width>=120?25:(width>=100?18:14);
+    c.state=c.address+c.addr_width+1; c.pid=c.state+(width>=100?11:8);
+    c.user=c.pid+8; c.cpu=c.user+(c.show_user?10:0); c.memory=c.cpu+7; c.command=c.memory+9;
+    return c;
+}
+static const char *short_command(const Process *p) {
+    const char *start=p->command;
+    for (const char *s=p->command;*s && *s!=' ';s++) if (*s=='/') start=s+1;
+    return start;
+}
+static void draw_table(const Snapshot *s,const Options *o,const size_t *list,size_t count,size_t selected,size_t *offset) {
+    int body=table_begin(),top=body-2,bottom=detail_begin(),visible=bottom-body-1;
+    if (visible<1) visible=1;
+    frame(stdscr,top,1,bottom-top,width-2,"PORTS",9);
+    char title[160]; snprintf(title,sizeof(title)," %s | %s %s | %zu %s ",o->all?"all sockets":"listeners + UDP",sort_name(o->sort),o->reverse?"rev":"asc",count,count==1?"row":"rows");
+    put(stdscr,top,width-(int)strlen(title)-4,width-14,9,"%s",title);
+    Columns c=table_columns();
+    put(stdscr,body-1,2,width-4,11,"%*s",width-4,"");
+    put(stdscr,body-1,c.port,6,11,"PORT"); put(stdscr,body-1,c.proto,6,11,"PROTO");
+    put(stdscr,body-1,c.address,c.addr_width,11,"LOCAL ADDRESS"); put(stdscr,body-1,c.state,c.pid-c.state-1,11,"STATE");
+    put(stdscr,body-1,c.pid,7,11,"%7s","PID");
+    if (c.show_user) put(stdscr,body-1,c.user,9,11,"USER");
+    put(stdscr,body-1,c.cpu,6,11,"%6s","CPU%"); put(stdscr,body-1,c.memory,8,11,"%8s","RSS MiB");
+    put(stdscr,body-1,c.command,width-c.command-3,11,"COMMAND");
     if (selected<*offset) *offset=selected;
     if (selected>=*offset+(size_t)visible) *offset=selected-(size_t)visible+1;
     for (int j=0;j<visible;j++) {
         size_t i=*offset+(size_t)j; if (i>=count) break;
         const Row *r=&s->rows[list[i]]; const Socket *sock=&s->sockets[r->socket];
         const Process *p=r->process==SIZE_MAX?NULL:&s->processes[r->process];
-        char row[PT_COMMAND+512],pid[24]; if (p) snprintf(pid,sizeof(pid),"%d",p->pid); else strcpy(pid,"-");
-        snprintf(row,sizeof(row),"%c%5u %-5s %-25.25s %-10s %7s %-10.10s %5.1f %8.1f %s",
-            i==selected?'>':' ',sock->port,sock->protocol,sock->address,socket_state(sock),pid,p?p->user:"?",p?p->cpu:0.,p?(double)p->rss/1048576.:0.,p?p->command:"(owner unavailable)");
-        put(stdscr,6+j,2,width-4,i==selected?5:0,"%-*.*s",width-4,width-4,row);
+        int y=body+j; bool chosen=i==selected; int text=chosen?5:0;
+        if (chosen) put(stdscr,y,2,width-4,5,"%*s",width-4,"");
+        put(stdscr,y,2,7,chosen?13:1,"%c%5u",chosen?'>':' ',sock->port);
+        put(stdscr,y,c.proto,5,chosen?5:2,"%s",sock->protocol);
+        char address[80]; clipped(address,sizeof(address),sock->address,c.addr_width);
+        put(stdscr,y,c.address,c.addr_width,text,"%s",address);
+        put(stdscr,y,c.state,c.pid-c.state-1,chosen?5:(sock->state==10 || sock->state==7?3:2),"%s",socket_state(sock));
+        char pid[24]="-"; if (p) snprintf(pid,sizeof(pid),"%d",p->pid);
+        put(stdscr,y,c.pid,7,text,"%7s",pid);
+        if (c.show_user) put(stdscr,y,c.user,9,chosen?5:2,"%s",p?p->user:"?");
+        put(stdscr,y,c.cpu,6,chosen?5:(p && p->cpu>=50?4:2),"%6.1f",p?p->cpu:0.);
+        put(stdscr,y,c.memory,8,text,"%8.1f",p?(double)p->rss/1048576.:0.);
+        put(stdscr,y,c.command,width-c.command-3,text,"%s",p?short_command(p):"(owner unavailable)");
     }
-    if (!count) put(stdscr,7,3,width-6,2,"No matching ports. / edit filter | a toggle all sockets");
-    rule(detail_top,"PROCESS DETAILS / [ ] scroll command");
-    if (count) {
-        const Row *r=&s->rows[list[selected]]; const Socket *sock=&s->sockets[r->socket];
-        const Process *p=r->process==SIZE_MAX?NULL:&s->processes[r->process];
-        put(stdscr,detail_top+1,3,width-6,3,"%s %s:%u -> %s:%u | %s | inode %" PRIu64,sock->protocol,sock->address,sock->port,sock->remote,sock->remote_port,socket_state(sock),sock->inode);
-        if (p) {
-            put(stdscr,detail_top+2,3,width-6,0,"PID %d  PPID %d  USER %s (%u)  CPU %.1f%%  RSS %.1f MiB",p->pid,p->ppid,p->user,p->uid,p->cpu,(double)p->rss/1048576.);
-            put(stdscr,detail_top+3,3,width-6,0,"CWD  %s",p->cwd);
-            put(stdscr,detail_top+4,3,width-6,0,"EXE  %s",p->exe);
-            size_t len=strlen(p->command),chunk=(size_t)(width-10),start=cmd_offset<len?cmd_offset:0;
-            put(stdscr,detail_top+5,3,width-6,2,"CMD  [%zu/%zu%s] (display joins argv with spaces)",start,len,p->truncated?", truncated at 16 KiB":"");
-            for (size_t j=0;j<2;j++) if (start+j*chunk<len)
-                put(stdscr,detail_top+6+(int)j,3,width-6,0,"     %.*s",(int)chunk,p->command+start+j*chunk);
-            char parents[4096]; snprintf(parents,sizeof(parents),"PARENTS  %d",p->pid);
-            for (size_t j=1;j<nchain;j++) {
-                size_t used=strlen(parents); snprintf(parents+used,sizeof(parents)-used," <- %d (%s)",chain[j].pid,chain[j].name);
-            }
-            put(stdscr,detail_top+8,3,width-6,2,"%s",parents);
-        } else put(stdscr,detail_top+3,3,width-6,4,"Owner unavailable: permissions, closing socket, or outside visible PID namespace.");
+    if (!count) put(stdscr,body,4,width-8,2,"No matching ports. / edit filter | a toggle all sockets");
+    put(stdscr,bottom-1,width-21,16,9," %zu/%zu ",count?selected+1:0,count);
+}
+static void draw_details(const Snapshot *s,const size_t *list,size_t count,size_t selected,
+                         size_t cmd_offset,const Process *chain,size_t nchain) {
+    int top=detail_begin(),rows=height-2-top;
+    frame(stdscr,top,1,rows,width-2,"PROCESS DETAILS",10);
+    put(stdscr,top,width-18,14,10," [ ] command ");
+    if (!count) { put(stdscr,top+2,4,width-8,2,"Select a port to inspect its process and launch chain."); return; }
+    const Row *r=&s->rows[list[selected]]; const Socket *sock=&s->sockets[r->socket];
+    const Process *p=r->process==SIZE_MAX?NULL:&s->processes[r->process];
+    if (!p) { put(stdscr,top+2,4,width-8,4,"Owner unavailable: permissions, closing socket, or outside visible PID namespace."); return; }
+    if (p->truncated) put(stdscr,top,width-31,27,4," CMD truncated | [ ] scroll ");
+    put(stdscr,top+1,3,width-6,0,"PID %d  PPID %d  USER %s  CPU %.1f%%  RSS %.1f MiB  PORT %u/%s",p->pid,p->ppid,p->user,p->cpu,(double)p->rss/1048576.,sock->port,sock->protocol);
+    int cmd=top+3,lines=1;
+    if (rows>=9) {
+        put(stdscr,top+2,3,width-6,3,"%s %s:%u -> %s:%u | %s | inode %" PRIu64,sock->protocol,sock->address,sock->port,sock->remote,sock->remote_port,socket_state(sock),sock->inode);
+        field(top+3,"CWD",p->cwd,0); field(top+4,"EXE",p->exe,2); cmd=top+5; lines=2;
+    } else field(top+2,"CWD",p->cwd,0);
+    size_t len=strlen(p->command),chunk=(size_t)detail_command_width(),start=cmd_offset<len?cmd_offset:0;
+    put(stdscr,cmd,3,8,2,"CMD");
+    for (int j=0;j<lines;j++) if (start+(size_t)j*chunk<len)
+        put(stdscr,cmd+j,11,(int)chunk,0,"%.*s",(int)chunk,p->command+start+(size_t)j*chunk);
+    char parents[4096]; snprintf(parents,sizeof(parents),"PARENTS %d",p->pid);
+    for (size_t j=1;j<nchain;j++) {
+        size_t used=strlen(parents); snprintf(parents+used,sizeof(parents)-used," <- %d (%s)",chain[j].pid,chain[j].name);
     }
-    put(stdscr,height-3,2,width-4,filtering?3:2,"%s%s",filtering?"FILTER > ":"Filter: ",o->filter);
-    put(stdscr,height-2,2,width-4,*message?4:2,"%s",*message?message:"arrows move  / filter  s sort  r reverse  a all  Space pause  k TERM  K KILL  ? help  q quit");
-    if (help) {
-        rule(5,"KEYBOARD HELP");
-        const char *lines[]={
-            "Up/Down or j     Select a port (j moves down; k terminates)",
-            "PgUp/PgDn        Move one page; Home/End jump to first/last",
-            "/                Filter by port, PID, user, address or command",
-            "Enter / Esc      Apply / cancel filter; Esc clears an applied filter",
-            "s / r            Cycle sort (port/PID/CPU/memory) / reverse",
-            "a                Toggle listeners + unconnected UDP / all sockets",
-            "Space / R        Pause sampling / refresh now",
-            "[ / ]            Scroll command text by one line",
-            "k / K            SIGTERM / SIGKILL confirmation popup",
-            "Popup Up/Down    Choose parent/child in launch chain",
-            "Popup s          Process only / Subtree with affected PIDs and ports",
-            "Popup Tab/Enter  Select Cancel/Terminate and activate (default Cancel)",
-            "Popup y / Esc    Confirm / cancel",
-            "? / q            Close help / quit",
-            "CPU: 100% = one core; first sample is zero. Only current network namespace."};
-        for (size_t i=0;i<sizeof(lines)/sizeof(*lines);i++) put(stdscr,6+(int)i,3,width-6,0,"%s",lines[i]);
+    char summary[4096]; clipped(summary,sizeof(summary),parents,width-6);
+    put(stdscr,top+rows-2,3,width-6,2,"%s",summary);
+}
+static void shortcut(int *x,const char *key,const char *label,int color) {
+    if (!key || !label) return;
+    int len=(int)(strlen(key)+strlen(label)+3);
+    if (*x+len>width-1) return;
+    put(stdscr,height-1,*x,(int)strlen(key)+2,color," %s ",key); *x+=(int)strlen(key)+2;
+    put(stdscr,height-1,*x,(int)strlen(label)+1,2,"%s ",label); *x+=(int)strlen(label)+1;
+}
+static void draw_help(void) {
+    int w=width-6; if (w>104) w=104;
+    int h=20,top=(height-h)/2,left=(width-w)/2;
+    for (int i=0;i<h;i++) put(stdscr,top+i,left,w,0,"%*s",w,"");
+    frame(stdscr,top,left,h,w,"KEYBOARD HELP",10);
+    const char *lines[]={
+        "Up/Down or j     Select a port (j moves down; k terminates)",
+        "PgUp/PgDn        Move one page; Home/End jump to first/last",
+        "/                Filter by port, PID, user, address or command",
+        "Enter / Esc      Apply / cancel filter; Esc clears an applied filter",
+        "s / r            Cycle sort (port/PID/CPU/memory) / reverse",
+        "a                Toggle listeners + unconnected UDP / all sockets",
+        "Space / R / c    Pause sampling / refresh now / next CPU core page",
+        "[ / ] / g        Scroll command / process axes vs host axes",
+        "k / K            SIGTERM / SIGKILL confirmation popup",
+        "Popup Up/Down    Choose parent/child in launch chain",
+        "Popup s          Process only / Subtree with affected PIDs and ports",
+        "Popup Tab/Enter  Select Cancel/Terminate (default Cancel) and activate",
+        "Popup y / Esc    Confirm / cancel",
+        "? / q            Close help / quit",
+        "CPU: 100% = one core. Only current network namespace."};
+    for (size_t i=0;i<sizeof(lines)/sizeof(*lines);i++) put(stdscr,top+2+(int)i,left+3,w-6,0,"%s",lines[i]);
+}
+static void draw(const Snapshot *s,const Options *o,const size_t *list,size_t count,size_t selected,
+                 size_t *offset,bool paused,bool filtering,bool help,Dialog *dialog,
+                 size_t cmd_offset,const Process *chain,size_t nchain,const char *message,
+                 const History *history,size_t core_page,bool shared_scale) {
+    getmaxyx(stdscr,height,width); erase();
+    if (width<80 || height<24) {
+        put(stdscr,0,0,width,1,"PortTop | terminal too small");
+        put(stdscr,2,0,width,0,"Resize to at least 80 columns x 24 rows. q: quit");
+        wnoutrefresh(stdscr); doupdate(); return;
     }
+    dimmed=dialog->open || help;
+    put(stdscr,0,2,8,1,"PORTTOP"); put(stdscr,0,11,9,2,"v%s",PT_VERSION);
+    if (width>=110) put(stdscr,0,23,width-65,2,"ports first, processes in context");
+    char status[128]; snprintf(status,sizeof(status)," %s | %ums | %s ",geteuid()==0?"all users":"current user",o->interval_ms,paused?"PAUSED":"LIVE");
+    put(stdscr,0,width-(int)strlen(status)-2,(int)strlen(status),2,"%s",status);
+    put(stdscr,0,width-(paused?9:7),paused?6:4,paused?4:3,"%s",paused?"PAUSED":"LIVE");
+    const Process *picked=NULL;
+    if (count && s->rows[list[selected]].process!=SIZE_MAX) picked=&s->processes[s->rows[list[selected]].process];
+    draw_metrics(s,history,picked,core_page,shared_scale);
+    draw_table(s,o,list,count,selected,offset); draw_details(s,list,count,selected,cmd_offset,chain,nchain);
+    if (*message && !filtering) put(stdscr,height-2,2,width-4,4,"%s",message);
+    else put(stdscr,height-2,2,width-4,filtering?3:2,"%s%s",filtering?"FILTER > ":"Filter: ",o->filter);
+    int x=1;
+    shortcut(&x,"arrows","move",1); shortcut(&x,"/","filter",1); shortcut(&x,"k","terminate",12);
+    shortcut(&x,"K","kill",12); shortcut(&x,"?","help",1); shortcut(&x,"q","quit",1);
+    if (width>=110) { shortcut(&x,"g","scale",1); shortcut(&x,"c","cores",1); shortcut(&x,"Space","pause",1); }
+    dimmed=false;
+    if (help) draw_help();
     wnoutrefresh(stdscr);
     if (dialog->open) draw_dialog(dialog,s);
     doupdate();
@@ -236,6 +420,7 @@ static void selected_chain(const Snapshot *s,const size_t *list,size_t count,siz
 int ui_run(Options *o) {
     if (tcgetattr(STDIN_FILENO,&saved)<0) { perror("porttop: terminal"); return 1; }
     setlocale(LC_ALL,"");
+    unicode=MB_CUR_MAX>1 && wcwidth(L'⣿')==1 && wcwidth(L'╭')==1;
     const char *term=getenv("TERM");
     if (!term || !*term || !strcmp(term,"dumb")) { fputs("porttop: set TERM to your terminal type, or use --once\n",stderr); return 1; }
     screen=newterm(NULL,stdout,stdin);
@@ -245,15 +430,27 @@ int ui_run(Options *o) {
     colors=o->color && has_colors();
     if (colors) {
         start_color(); use_default_colors();
-        init_pair(1,COLOR_CYAN,-1); init_pair(2,COLOR_WHITE,-1); init_pair(3,COLOR_GREEN,-1);
-        init_pair(4,COLOR_YELLOW,-1); init_pair(5,COLOR_WHITE,COLOR_BLUE);
+        if (COLORS>=256) {
+            init_pair(1,80,-1); init_pair(2,244,-1); init_pair(3,114,-1); init_pair(4,179,-1);
+            init_pair(5,255,23); init_pair(6,176,-1); init_pair(7,65,-1); init_pair(8,143,-1);
+            init_pair(9,174,-1); init_pair(10,67,-1); init_pair(11,250,235); init_pair(12,203,-1);
+            init_pair(13,117,23); init_pair(16,255,88);
+        } else {
+            init_pair(1,COLOR_CYAN,-1); init_pair(2,COLOR_WHITE,-1); init_pair(3,COLOR_GREEN,-1);
+            init_pair(4,COLOR_YELLOW,-1); init_pair(5,COLOR_WHITE,COLOR_BLUE); init_pair(6,COLOR_MAGENTA,-1);
+            init_pair(7,COLOR_GREEN,-1); init_pair(8,COLOR_YELLOW,-1); init_pair(9,COLOR_RED,-1);
+            init_pair(10,COLOR_CYAN,-1); init_pair(11,COLOR_WHITE,COLOR_BLACK); init_pair(12,COLOR_RED,-1);
+            init_pair(13,COLOR_CYAN,COLOR_BLUE); init_pair(16,COLOR_WHITE,COLOR_RED);
+        }
     }
     struct sigaction sa={0}; sa.sa_handler=handler; sigemptyset(&sa.sa_mask);
     sigaction(SIGINT,&sa,NULL); sigaction(SIGTERM,&sa,NULL); sigaction(SIGHUP,&sa,NULL);
     sigaction(SIGTSTP,&sa,NULL); sigaction(SIGWINCH,&sa,NULL);
+    History history={0}; size_t core_page=0;
     Snapshot s={0}; size_t *list=NULL,count=0,selected=0,offset=0,cmd_offset=0,nchain=0;
     Process chain[MAX_CHAIN]; Dialog *dialog=calloc(1,sizeof(*dialog));
     if (!dialog) { restore(); delscreen(screen); return 1; }
+    bool shared_scale=false;
     bool paused=false,filtering=false,help=false,refresh=true,dirty=true;
     char message[512]="",old_filter[256]=""; int result=0; double next=0;
     while (!stopping) {
@@ -287,13 +484,14 @@ int ui_run(Options *o) {
                     Row r=s.rows[list[i]]; Process *p=r.process==SIZE_MAX?NULL:&s.processes[r.process];
                     if (s.sockets[r.socket].inode==inode && (p?p->pid:0)==pid && (p?p->start:0)==start) { selected=i; break; }
                 }
+                if (history_push(&history,&s)<0) { result=1; break; }
                 offset=selected>screen_row?selected-screen_row:0;
                 selected_chain(&s,list,count,selected,chain,&nchain);
             }
             refresh=false; next=monotonic_seconds()+(double)o->interval_ms/1000.; dirty=true;
         }
         if (dirty) {
-            draw(&s,o,list,count,selected,&offset,paused,filtering,help,dialog,cmd_offset,chain,nchain,message);
+            draw(&s,o,list,count,selected,&offset,paused,filtering,help,dialog,cmd_offset,chain,nchain,message,&history,core_page,shared_scale);
             dirty=false;
         }
         int delay=250;
@@ -348,15 +546,17 @@ int ui_run(Options *o) {
             case KEY_UP: if (selected) --selected; cmd_offset=0; break;
             case KEY_HOME: selected=0; cmd_offset=0; break;
             case KEY_END: selected=count?count-1:0; cmd_offset=0; break;
-            case KEY_PPAGE: { size_t page=(size_t)(height>24?height-20:4); selected=selected>page?selected-page:0; cmd_offset=0; break; }
-            case KEY_NPAGE: { size_t page=(size_t)(height>24?height-20:4); selected=selected+page<count?selected+page:(count?count-1:0); cmd_offset=0; break; }
+            case KEY_PPAGE: { size_t page=(size_t)(detail_begin()-table_begin()-1); selected=selected>page?selected-page:0; cmd_offset=0; break; }
+            case KEY_NPAGE: { size_t page=(size_t)(detail_begin()-table_begin()-1); selected=selected+page<count?selected+page:(count?count-1:0); cmd_offset=0; break; }
             case ' ': paused=!paused; break;
             case 'R': refresh=true; break;
+            case 'c': ++core_page; break;
+            case 'g': shared_scale=!shared_scale; break;
             case 's': o->sort=(Sort)((o->sort+1)%4); selected=offset=0; break;
             case 'r': o->reverse=!o->reverse; selected=offset=0; break;
             case 'a': o->all=!o->all; refresh=true; selected=offset=0; break;
-            case '[': { size_t n=(size_t)(width>10?width-10:1); cmd_offset=cmd_offset>n?cmd_offset-n:0; break; }
-            case ']': if (cmd_offset<PT_COMMAND) cmd_offset+=(size_t)(width>10?width-10:1); break;
+            case '[': { size_t n=(size_t)detail_command_width(); cmd_offset=cmd_offset>n?cmd_offset-n:0; break; }
+            case ']': if (cmd_offset<PT_COMMAND) cmd_offset+=(size_t)detail_command_width(); break;
             case 'k': case 't': case 'K':
                 if (count && nchain) {
                     dialog->length=nchain; memcpy(dialog->chain,chain,nchain*sizeof(*chain));
@@ -375,7 +575,7 @@ int ui_run(Options *o) {
         }
     }
 done:
-    dialog_close(dialog); free(dialog); free(list); snapshot_free(&s); restore(); delscreen(screen);
+    dialog_close(dialog); free(dialog); free(list); snapshot_free(&s); history_free(&history); restore(); delscreen(screen);
     if (result) fprintf(stderr,"porttop: terminal or sampling failure: %s\n",strerror(errno));
     return result;
 }

@@ -123,16 +123,35 @@ static size_t inode_find(const Snapshot *s,uint64_t inode) {
     }
     return lo;
 }
-static void host_read(Snapshot *s,const Snapshot *prev) {
+static bool cpu_delta(uint64_t ticks,uint64_t idle,uint64_t old_ticks,uint64_t old_idle,double *usage) {
+    if (ticks<=old_ticks || idle<old_idle || idle-old_idle>ticks-old_ticks) return false;
+    *usage=100.*(1.-(double)(idle-old_idle)/(double)(ticks-old_ticks)); return true;
+}
+static int host_read(Snapshot *s,const Snapshot *prev) {
     FILE *f=fopen("/proc/stat","re");
     if (f) {
-        unsigned long long v[8]={0};
-        if (fscanf(f,"cpu %llu %llu %llu %llu %llu %llu %llu %llu",v,v+1,v+2,v+3,v+4,v+5,v+6,v+7)==8) {
-            for (int i=0;i<8;i++) s->host_ticks+=(uint64_t)v[i];
-            s->host_idle=(uint64_t)(v[3]+v[4]);
-            if (prev && prev->sampled_at>0 && s->host_ticks>prev->host_ticks && s->host_idle>=prev->host_idle)
-                s->host_cpu=100.*(1.-(double)(s->host_idle-prev->host_idle)/(double)(s->host_ticks-prev->host_ticks));
-        } fclose(f);
+        char line[512];
+        while (fgets(line,sizeof(line),f)) {
+            char name[32]; unsigned long long v[8]={0};
+            if (sscanf(line,"%31s %llu %llu %llu %llu %llu %llu %llu %llu",name,v,v+1,v+2,v+3,v+4,v+5,v+6,v+7)!=9) continue;
+            if (strncmp(name,"cpu",3)) continue;
+            uint64_t ticks=0,idle=(uint64_t)(v[3]+v[4]);
+            for (int i=0;i<8;i++) ticks+=(uint64_t)v[i];
+            if (!strcmp(name,"cpu")) {
+                s->host_ticks=ticks; s->host_idle=idle;
+                if (prev && prev->sampled_at>0)
+                    s->host_cpu_valid=cpu_delta(ticks,idle,prev->host_ticks,prev->host_idle,&s->host_cpu);
+            } else {
+                char *end; unsigned long id=strtoul(name+3,&end,10);
+                if (*end || !name[3] || id>UINT32_MAX) continue;
+                Cpu cpu={.id=(unsigned)id,.ticks=ticks,.idle=idle};
+                if (prev) for (size_t i=0;i<prev->ncores;i++) if (prev->cores[i].id==cpu.id) {
+                    cpu.valid=cpu_delta(ticks,idle,prev->cores[i].ticks,prev->cores[i].idle,&cpu.usage); break;
+                }
+                if (append((void **)&s->cores,&s->ncores,sizeof(cpu),&cpu)<0) { fclose(f); return -1; }
+            }
+        }
+        fclose(f);
     }
     f=fopen("/proc/meminfo","re");
     if (f) { char line[256]; unsigned long long n;
@@ -141,9 +160,10 @@ static void host_read(Snapshot *s,const Snapshot *prev) {
             if (sscanf(line,"MemAvailable: %llu kB",&n)==1) s->mem_available=(uint64_t)n*1024;
         } fclose(f);
     }
+    return 0;
 }
 int snapshot_read(Snapshot *s,const Snapshot *prev,bool all) {
-    memset(s,0,sizeof(*s)); s->sampled_at=monotonic_seconds(); host_read(s,prev);
+    memset(s,0,sizeof(*s)); s->sampled_at=monotonic_seconds(); if (host_read(s,prev)<0) goto fail;
     if (read_sockets(s,"tcp",false,false,all)<0 || read_sockets(s,"tcp6",true,false,all)<0 ||
         read_sockets(s,"udp",false,true,all)<0 || read_sockets(s,"udp6",true,true,all)<0) goto fail;
     if (s->unavailable_tables==4) { errno=EACCES; goto fail; }
@@ -181,6 +201,7 @@ int snapshot_read(Snapshot *s,const Snapshot *prev,bool all) {
             if (dt>0) for (size_t j=0;j<prev->nprocesses;j++) {
                 const Process *old=&prev->processes[j];
                 if (old->pid==p.pid && old->start==p.start && p.ticks>=old->ticks) {
+                    p.cpu_valid=true;
                     p.cpu=100.*(double)(p.ticks-old->ticks)/(double)sysconf(_SC_CLK_TCK)/dt; break;
                 }
             }
@@ -205,7 +226,7 @@ int snapshot_read(Snapshot *s,const Snapshot *prev,bool all) {
     free(owned); return 0;
 fail: { int saved=errno; snapshot_free(s); errno=saved; return -1; }
 }
-void snapshot_free(Snapshot *s) { free(s->sockets); free(s->processes); free(s->rows); memset(s,0,sizeof(*s)); }
+void snapshot_free(Snapshot *s) { free(s->cores); free(s->sockets); free(s->processes); free(s->rows); memset(s,0,sizeof(*s)); }
 const char *socket_state(const Socket *s) {
     static const char *names[]={"UNKNOWN","ESTAB","SYN-SENT","SYN-RECV","FIN-WAIT1","FIN-WAIT2","TIME-WAIT","UNCONN","CLOSE-WAIT","LAST-ACK","LISTEN","CLOSING","NEW-SYN"};
     return s->state<sizeof(names)/sizeof(*names)?names[s->state]:"UNKNOWN";
@@ -247,12 +268,14 @@ static int row_cmp(const void *a,const void *b) {
     if (!c) c=(sx->inode>sy->inode)-(sx->inode<sy->inode);
     return sort_options->reverse?-c:c;
 }
+bool process_visible(const Process *p,uid_t viewer) { return viewer==0 || (p && p->uid==viewer); }
 size_t *rows_select(const Snapshot *s,const Options *o,size_t *count) {
     *count=0;
     size_t *list=malloc((s->nrows?s->nrows:1)*sizeof(size_t)); if (!list) return NULL;
     for (size_t i=0;i<s->nrows;i++) {
         const Row *r=&s->rows[i]; const Socket *sock=&s->sockets[r->socket];
         const Process *p=r->process==SIZE_MAX?NULL:&s->processes[r->process];
+        if (!process_visible(p,geteuid())) continue;
         if (o->port && o->port!=sock->port) continue;
         if (*o->filter) {
             char nums[64]; snprintf(nums,sizeof(nums),"%u %d",sock->port,p?p->pid:0);
@@ -276,8 +299,10 @@ static void json_string(const char *s) {
 void print_snapshot(const Snapshot *s,const Options *o) {
     size_t count; size_t *rows=rows_select(s,o,&count);
     if (!rows) { fputs("porttop: out of memory\n",stderr); exit(1); }
-    if (o->json) printf("{\"version\":\"%s\",\"denied_processes\":%zu,\"unknown_sockets\":%zu,\"unavailable_tables\":%zu,\"cpu_sampled\":false,\"rows\":[",PT_VERSION,s->denied,s->unknown,s->unavailable_tables);
-    else puts("PORT  PROTO LOCAL ADDRESS                           STATE           PID USER         RSS MiB COMMAND");
+    if (o->json) {
+        printf("{\"scope\":\"%s\",\"viewer_uid\":%u,\"system\":{\"cpu_count\":%zu,\"memory_total_bytes\":%" PRIu64 ",\"memory_available_bytes\":%" PRIu64 "},",geteuid()==0?"all":"current-user",geteuid(),s->ncores,s->mem_total,s->mem_available);
+        printf("\"version\":\"%s\",\"denied_processes\":%zu,\"unknown_sockets\":%zu,\"unavailable_tables\":%zu,\"cpu_sampled\":false,\"rows\":[",PT_VERSION,s->denied,s->unknown,s->unavailable_tables);
+    } else puts("PORT  PROTO LOCAL ADDRESS                           STATE           PID USER         RSS MiB COMMAND");
     for (size_t i=0;i<count;i++) {
         const Row *r=&s->rows[rows[i]]; const Socket *sock=&s->sockets[r->socket];
         const Process *p=r->process==SIZE_MAX?NULL:&s->processes[r->process];

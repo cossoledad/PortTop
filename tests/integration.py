@@ -26,12 +26,14 @@ def snapshot(*args):
     return json.loads(p.stdout)
 
 class Terminal:
-    def __init__(self, *args):
+    def __init__(self, *args, locale="C.UTF-8", color=False):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 36, 130, 0, 0))
         self.original = termios.tcgetattr(slave)
         self.slave = slave
-        self.process = subprocess.Popen([BIN, "--no-color", *map(str, args)], stdin=slave, stdout=slave, stderr=slave, env={**os.environ, "TERM": "xterm-256color"})
+        terminal_env = {**os.environ, "TERM": "xterm-256color", "LC_ALL": locale}
+        if color: terminal_env.pop("NO_COLOR", None)
+        self.process = subprocess.Popen([BIN, *([] if color else ["--no-color"]), *map(str, args)], stdin=slave, stdout=slave, stderr=slave, env=terminal_env)
         self.data = b""
         self.screen = Screen()
     def send(self, data):
@@ -95,7 +97,12 @@ try:
     pid, child, ports = info["pid"], info["child"], info["ports"]
     data = snapshot()
     assert data["unavailable_tables"] == 0
+    assert data["scope"] == ("all" if os.geteuid() == 0 else "current-user")
+    assert data["viewer_uid"] == os.geteuid() and data["system"]["cpu_count"] > 0
     rows = data["rows"]
+    if os.geteuid() != 0:
+        assert all(r["process"] and r["process"]["uid"] == os.geteuid() for r in rows)
+
     assert [r["port"] for r in rows] == sorted(r["port"] for r in rows)
     for proto, port in ports.items():
         matches = [r for r in rows if r["port"] == port and r["protocol"] == proto]
@@ -131,6 +138,9 @@ try:
     # Select one owner by PID, cancel TERM first, then confirm. Other owner survives.
     term = Terminal("-p", ports["tcp"], "-f", pid, "-i", 100)
     term.until(b"PROCESS DETAILS")
+    term.until(b"CPU HISTORY")
+    term.until(b"MEM HISTORY")
+    term.until(f"* PID {pid}".encode())
     term.until(b"PARENTS")
     assert f"{fixture.pid} (bash)" in term.screen.text
     term.send(b" ")
@@ -198,6 +208,7 @@ try:
     assert not snapshot("-p", ports["tcp"])["rows"]
     term = Terminal("--port", ports["tcp"])
     term.until(b"PROCESS DETAILS")
+    term.drain(.1)
     term.process.send_signal(signal.SIGTSTP)
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -205,7 +216,7 @@ try:
         if stopped:
             assert os.WIFSTOPPED(status)
             break
-        select.select([], [], [], .01)
+        term.drain(.02)
     else:
         raise AssertionError("suspend timed out")
     assert termios.tcgetattr(term.slave) == term.original
@@ -327,3 +338,78 @@ try:
 finally:
     if term: term.close(external=True)
     for sock in owned_sockets: sock.close()
+
+# Dynamic CPU and resident memory must actually change in the selected series.
+load = subprocess.Popen([sys.executable, str(ROOT / "tests/load_fixture.py")],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, start_new_session=True)
+term = None
+try:
+    assert select.select([load.stdout], [], [], 5)[0]
+    info = json.loads(load.stdout.readline())
+    term = Terminal("--port", info["port"], "--interval", 100)
+    term.until(f"* PID {load.pid}".encode())
+    term.until(b"MEM HISTORY")
+    term.drain(.3)
+    before = term.screen.text
+    rss_before = next(r["process"]["rss_bytes"] for r in snapshot("-p", info["port"])["rows"] if r["process"] and r["process"]["pid"] == load.pid)
+    load.stdin.write("load\n"); load.stdin.flush()
+    assert select.select([load.stdout], [], [], 5)[0]
+    assert load.stdout.readline().strip() == "loaded"
+    term.drain(.6)
+    after = term.screen.text
+    rss_after = next(r["process"]["rss_bytes"] for r in snapshot("-p", info["port"])["rows"] if r["process"] and r["process"]["pid"] == load.pid)
+    assert rss_after-rss_before >= 40*1024*1024
+    cpu = re.search(r"TOTAL[^|]+\| PID ([0-9.]+)%", after)
+    assert cpu and float(cpu.group(1))>0, after
+    assert before.splitlines()[2] != after.splitlines()[2], (before, after)
+    core_title = next(line for line in after.splitlines() if "CORES" in line)
+    plot_right = core_title.index("CORES")-2
+    legend_row = next(i for i, line in enumerate(after.splitlines()) if "* PID" in line)
+    assert any(0x2800 <= ord(ch) <= 0x28ff and (ord(ch)-0x2800)&0xb8
+               for line in after.splitlines()[3:legend_row-1] for ch in line[3:plot_right]), "process CPU curve must rise above baseline"
+    term.send(b"g")
+    term.until(b"CPU scaled to")
+    term.send(b"g")
+    term.until(b"axes: CPU")
+    labels_before = re.search(r"CORES (\d+)-(\d+)/(\d+)", term.screen.text).groups()
+    term.send(b"c")
+    term.drain(.15)
+    if int(labels_before[1]) < info["cores"]:
+        assert labels_before != re.search(r"CORES (\d+)-(\d+)/(\d+)", term.screen.text).groups()
+    term.resize(24, 80)
+    term.drain(.3)
+    term.until(b"CPU HISTORY")
+    term.until(b"MEM HISTORY")
+    term.until(b"PROCESS DETAILS")
+    term.close()
+    term = None
+    print("PASS charts: UID default, system/selected history, actual CPU/RSS change, core paging, compact layout")
+finally:
+    if term: term.close(external=True)
+    if load.poll() is None: load.terminate()
+    load.wait(timeout=5)
+
+# Panels, adaptive columns, the 256-color theme and the C-locale fallback.
+for locale, color in [("C.UTF-8", True), ("C", False)]:
+    term = Terminal(locale=locale, color=color)
+    try:
+        term.until(b"Filter:")
+        term.until(b"CPU HISTORY")
+        term.until(b"MEM HISTORY")
+        term.until(b"PROCESS DETAILS")
+        if color: assert b"\x1b[38;5;" in term.data
+        for rows, cols in [(31, 107), (24, 80), (36, 130)]:
+            term.resize(rows, cols)
+            term.drain(.3)
+            text = term.screen.text
+            for title in ["CPU HISTORY", "MEM HISTORY", "PORTS", "PROCESS DETAILS"]:
+                assert title in text, (rows, cols, text)
+            if locale != "C": assert text.count("╭") == 4 and text.count("╰") == 4
+            else: assert "╭" not in text and "+" in text
+            assert "arrows" in text and "terminate" in text
+        term.send(b"?")
+        term.until(b"KEYBOARD HELP")
+        term.send(b"?")
+    finally:
+        term.close()
+print("PASS presentation: framed panels, 80/107/130 columns, UTF-8 and ASCII, color and monochrome")

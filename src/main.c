@@ -21,8 +21,8 @@ static void usage(FILE *f) {
         "  -h, --help             Show help\n"
         "  -v, --version          Show version\n\n"
         "Keys: arrows move, j down, / filter, s sort, r reverse, a all sockets,\n"
-        "      Space pause, k SIGTERM, K SIGKILL (popup supports parents/subtrees), ? help, q quit.\n"
-        "Default: TCP listeners and unconnected UDP sockets in this network namespace.\n", PT_VERSION);
+        "      Space pause, c CPU core page, g graph scale, k SIGTERM, K SIGKILL (popup supports parents/subtrees), ? help, q quit.\n"
+        "Default: current user only; root sees all visible owners. TCP listeners + UDP.\n", PT_VERSION);
 }
 static unsigned number(const char *s, unsigned low, unsigned high) {
     char *end; errno = 0;

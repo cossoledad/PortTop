@@ -4,12 +4,40 @@
 #include <sys/socket.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+static void check_history(void) {
+    History h={0}; Process p={.pid=12345,.uid=geteuid(),.start=100,.cpu=150.,.rss=250,.cpu_valid=true};
+    Snapshot s={.processes=&p,.nprocesses=1,.ncores=2,.host_cpu=70.,.host_cpu_valid=true,
+        .mem_total=1000,.mem_available=400,.sampled_at=1.};
+    assert(history_push(&h,&s)==0 && h.count==1);
+    assert(h.points[0].cpu==70. && h.points[0].memory==60. && h.points[0].cores==2);
+    const ProcessHistory *series=history_process(&h,p.pid,p.start);
+    double cpu_axis; uint64_t memory_axis;
+    history_scale(&h,series,&cpu_axis,&memory_axis);
+    assert(cpu_axis==200. && memory_axis==32*1024*1024);
+    assert(series && series->points[0].cpu==150. && series->points[0].rss==250);
+    s.nprocesses=0; s.sampled_at++;
+    assert(history_push(&h,&s)==0);
+    series=history_process(&h,p.pid,p.start); assert(series && !series->points[1].present);
+    s.nprocesses=1; p.start=200; p.cpu=25.;
+    assert(history_push(&h,&s)==0);
+    assert(history_process(&h,p.pid,100) && history_process(&h,p.pid,200));
+    assert(!history_process(&h,p.pid,200)->points[0].present);
+    for (int i=0;i<PT_HISTORY;i++) assert(history_push(&h,&s)==0);
+    assert(h.count==PT_HISTORY && h.nprocesses==1 && !history_process(&h,p.pid,100));
+    history_free(&h);
+    Process owned={.uid=1000},other={.uid=2000};
+    assert(process_visible(&owned,1000) && !process_visible(&other,1000) && !process_visible(NULL,1000));
+    assert(process_visible(&owned,0) && process_visible(&other,0) && process_visible(NULL,0));
+}
+
 int main(void) {
+    check_history();
     Process p;
     assert(prctl(PR_SET_NAME,"pt (odd) name",0,0,0)==0);
     assert(process_read(getpid(),&p)==0);
@@ -62,17 +90,21 @@ int main(void) {
     assert(listen(listener,1)==0);
     Snapshot first={0},second={0};
     assert(snapshot_read(&first,NULL,false)==0);
+    assert(first.ncores>0 && !first.host_cpu_valid);
     double deadline=monotonic_seconds()+0.15;
     volatile unsigned long work=0;
     while (monotonic_seconds()<deadline) work++;
     assert(snapshot_read(&second,&first,false)==0);
+    assert(second.host_cpu_valid && second.host_cpu>=0 && second.host_cpu<=100);
+    assert(second.ncores>0);
+    for (size_t i=0;i<second.ncores;i++) assert(second.cores[i].usage>=0 && second.cores[i].usage<=100);
     bool measured=false;
     for (size_t i=0;i<second.nprocesses;i++) if (second.processes[i].pid==getpid()) {
-        assert(second.processes[i].cpu>0);
+        assert(second.processes[i].cpu>0 && second.processes[i].cpu_valid);
         measured=true;
     }
     assert(measured);
     snapshot_free(&first); snapshot_free(&second); close(listener);
-    puts("PASS core: process stat parsing, identity checks, pidfd signals, terminal text, live CPU sampling, subtree preflight and ancestor protection");
+    puts("PASS core: process stat parsing, identity checks, pidfd signals, terminal text, live per-core sampling, history ring and UID scope, subtree preflight and ancestor protection");
     return 0;
 }

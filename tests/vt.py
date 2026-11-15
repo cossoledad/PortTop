@@ -1,10 +1,12 @@
-"""Small ASCII VT screen used to assert ncurses screen state, not output chunks.
+"""Small UTF-8 VT screen used to assert ncurses screen state, not output chunks.
 Supports the xterm sequences emitted by this application's ncurses rendering.
 """
 import re
+import codecs
 
 class Screen:
     def __init__(self, height=36, width=130):
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.height, self.width = height, width
         self.rows = [[" "] * width for _ in range(height)]
         self.y = self.x = 0
@@ -67,7 +69,7 @@ class Screen:
         elif op == "M":
             for _ in range(n): self.rows.pop(self.y); self.rows.insert(self.bottom,[" "]*self.width)
     def feed(self, data):
-        text = self.pending + data.decode("ascii", errors="replace")
+        text = self.pending + self.decoder.decode(data)
         i = 0
         while i < len(text):
             c = text[i]

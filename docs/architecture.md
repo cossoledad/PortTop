@@ -7,12 +7,15 @@
 | `src/main.c` | 参数校验、TTY 检测、批处理或交互入口 |
 | `src/porttop.h` | Socket / Process / Row / Snapshot / SignalPlan 契约 |
 | `src/proc.c` | Linux socket/owner 采集、排序筛选、文本/JSON 输出、单目标 pidfd 信号 |
+| `src/history.c` | 系统与进程采样历史环，按 PID + start ticks 隔离、保留缺口和淘汰旧记录 |
 | `src/actions.c` | 自身祖先保护、有限子树预览、所有目标预检和逐个发送 |
 | `src/ui.c` | ncurses 屏幕、事件循环、选中身份、居中终止弹窗、终端生命周期 |
 | `tests/core.c` | stat 解析、CPU 差分、pidfd 及子树身份安全 |
 | `tests/integration.py` | 实际进程/socket、PTY、重启链与列表稳定性验收 |
-| `tests/vt.py` | 测试用 ASCII VT 屏幕模型，解析 ncurses 差分输出 |
+| `tests/vt.py` | 测试用增量 UTF-8 VT 屏幕模型，解析 ncurses 差分输出 |
 | `tests/fixture.py` | 多协议、共享 FD、fork 测试服务 |
+| `install.sh` / `tests/install.py` | 用户安装、显式快进升级、卸载与隔离验收 |
+| `tests/load_fixture.py` | 可控 RSS 增长和 CPU 负载，用于实际图表变化验收 |
 | `tests/supervisor_fixture.py` | launcher、重启 supervisor、服务、无端口 worker 和兄弟服务 |
 
 ## 采集与展示
@@ -25,11 +28,27 @@ CPU 使用前后快照的进程 ticks 差值 / `_SC_CLK_TCK` / 实际单调时�
 
 `denied_processes` 是打不开 FD 目录的进程数；`unknown_sockets` 是没有匹配进程的 socket 数；`unavailable_tables` 是无法打开的网络表数量。统计作用于完整采集结果，不受筛选影响；每个 FD 及附加元数据读失败不单独计数。
 
+## 用户范围与历史曲线
+
+默认视图判定统一在 `rows_select`：viewer 为有效 UID 0 时保留所有原始行，否则必须有已识别 owner 且其 UID 等于 viewer。该投影用于交互、文本与 JSON，`--all` 不改变它。进程 UID 取 `/proc/<pid>` 目录属主，属于归属过滤而非启动历史追踪。普通用户的祖先选择也在跨 UID 处停止。root 不绕过 namespace、LSM 或 proc 挂载的实际限制。
+
+Snapshot 仍保留完整可采集数据，诊断计数基于它；JSON 的 `scope`、`viewer_uid`、`system` 明示视图和系统容量。系统 CPU/内存统计不按 UID 过滤。此规则是默认展示范围，不是操作授权；实际信号仍经过内核 pidfd 权限检查。
+
+`/proc/stat` 解析总 CPU 和每个 `cpuN`；总量只累加 user/nice/system/idle/iowait/irq/softirq/steal，避免重复计入 guest。CPU 差分必须满足总 ticks 递增且 idle 差值在合理范围，否则标为无效；每核按 ID 匹配前一帧以支持核上下线。进程 CPU 也标记是否存在有效前帧，避免把缺失采样当作测得 0。
+
+History 为 240 点环，每次成功采样追加一帧系统 CPU、内存、核数、总内存和单调时间。每个当前用户范围内的 socket owner 按 PID + start ticks 存独立 CPU/RSS 序列，与主环共享 slot。每帧先清空该 slot 的进程存在标记，再填当前数据；退出、缺失和 PID 复用不会拼接曲线。240 帧未出现的进程历史被淘汰。同一进程的多个端口复用同一条曲线，切换过滤或选择可立即读取已有历史。
+
+界面左右两图分别为系统 CPU 与系统内存，固定 0–100% 刻度。UTF-8 模式使用 Braille 点阵，每个单元左侧 4 点用于系统填充、右侧 4 点用于选中进程轨迹；混合单元采用进程颜色，其余系统区域保持原色。用户文本仍为 ASCII。locale 不支持宽字符时保留原密度字符及 `*` 虚线作为回退。默认进程曲线采用独立刻度，CPU 上限从 100% 起、内存从 32 MiB 起按 2 倍扩展至覆盖保留历史峰值，并在图例显示。按 g 切换统一刻度：进程 CPU 图值 = top 风格 CPU% / 该历史帧的核数，内存图值 = RSS / 该帧系统总内存。独立刻度让小服务的实际变化可见，统一刻度用于比较系统贡献。标题始终保留进程原始 CPU% 和 RSS MiB。每个逻辑核另有实时仪表，按 c 翻页，不为适配核数而动态增加面板高度。
+
+历史只在成功采样时推进；暂停、弹窗与采集失败不追加。窗口宽度只改变读取环的范围，不重置历史。横轴是一列一次采样，非均匀墙钟时间轴；没有跨重启持久化。图高在固定的 24 行压缩模式和 32 行以上完整模式间切换，压缩模式省略 EXE 等详情以保留列表空间。
+
 ## ncurses 与稳定刷新
 
 事件循环在数据更新、用户输入和窗口变化时绘制。`erase()` 只清理 stdscr 的虚拟内容，随后 `wnoutrefresh(stdscr)`；如有弹窗，绘制并暂存独立 WINDOW；最后只执行一次 `doupdate()`。不在常规采样时使用 `clear()`、`clearok()` 或直接输出清屏 ANSI 序列。差分刷新依据 [ncurses 刷新契约](https://invisible-island.net/ncurses/man/curs_refresh.3x.html)。暂停且没有输入或尺寸变化时，不绘制也不输出。
 
-分区布局固定，不随命令长度和端口数改变。刷新按 inode + PID + start ticks 恢复选中身份；根据刷新前选中行相对滚动窗口的位置修正 offset，在边界允许时保留屏幕行。CPU/RSS 排序仍会根据真实数值重排，选中目标消失时选邻近行；这与绘制闪烁是不同边界。
+面板使用圆角边框和语义配色（CPU 绿、内存橄榄色、端口暖色、详情蓝），支持 256 色、基础色与无颜色回退。顶部 CPU 面板内部固定分为图表和核网格，内存另有面板；中部端口表和底部详情均有完整边框。表格按宽度调整地址、命令和 USER 列；详情高度压缩为完整 9 行或紧凑 6 行，释放列表空间。命令列表省略首个可执行路径，详情滚动读取仍使用原 cmdline。弹窗和帮助遮罩只改变绘制样式，不改变确认协议。
+
+分区布局固定，不随命令长度、端口数和核数改变。刷新按 inode + PID + start ticks 恢复选中身份；根据刷新前选中行相对滚动窗口的位置修正 offset，在边界允许时保留屏幕行。CPU/RSS 排序仍会根据真实数值重排，选中目标消失时选邻近行；这与绘制闪烁是不同边界。
 
 输入由 ncurses keypad / getch 处理。内核 WINCH 信号触发实际尺寸检查和 resizeterm；ncurses 合成的 KEY_RESIZE 仅请求重绘，不能再次无条件触发 resizeterm，否则形成事件反馈循环。弹窗存活至关闭或尺寸变化，不因每次采样反复创建。
 
@@ -51,6 +70,14 @@ SignalPlan 保存 PID、PPID、start ticks、name 和截断至 1 KiB 的预览�
 4. 对捕获的有限集合按 root-first 顺序 pidfd_send_signal，分别计 sent / exited / failed。操作中途失败属于部分结果，不宣称回滚或原子性。
 
 不执行负 PID / 进程组 kill，不扫描“新 PID”自动追加到已确认集合，也不按名字推测服务。父进程和子树必须由用户在预览中选择。树外监督者、已脱离父子关系的后代、预览后派生的新进程可能继续存在；通用工具不能修改 systemd 或任意 supervisor 的单项重启策略。
+
+## 用户安装与升级
+
+`install.sh` 默认前缀 `$HOME/.local`，拒绝未显式指定 --system 的 root 调用；不自动提权或修改 shell 配置。使用独立的 `build/install.*` 构建目录，在 staging 文件具备可执行版本输出后替换安装文件。升级助手通过 Bash 安全引用原始源码路径及前缀，支持含空格的目录。
+
+`--upgrade` 要求是源码根 Git checkout、工作区干净、有 upstream；仅执行 `git pull --ff-only`，然后重新执行更新后的脚本。构建失败保留原安装文件，不回滚已快进的源码。安装清单只保存格式标签和两个文件哈希，不 source 或执行清单内容；卸载前核对两个文件，任一变化时不删除。每个二进制以同目录 rename 替换，不宣称整个安装具有多文件事务性。
+
+Makefile 的 `BUILD_DIR` 支持独立构建，`PREFIX` 默认也改为用户目录；底层 Make 安装目标仍用于二进制打包，脚本承担升级助手和清单生命周期。详见 [安装文档](install.md)。
 
 ## 后续扩展边界
 
