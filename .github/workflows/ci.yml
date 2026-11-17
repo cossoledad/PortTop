@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  LC_ALL: C.UTF-8
+  TERM: xterm-256color
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.compiler }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        compiler: [gcc, clang]
+    env:
+      CC: ${{ matrix.compiler }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang pkg-config libncurses-dev python3
+      - name: Build and test with warnings as errors
+        run: |
+          mkdir -p build
+          make -j2 CFLAGS='-O2 -g -std=c11 -Wall -Wextra -Wpedantic -Wformat=2 -Wshadow -Wconversion -Werror' test 2>&1 | tee build/test.log
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: diagnostics-${{ matrix.os }}-${{ matrix.compiler }}
+          path: |
+            build/test.log
+            build/pty-failure.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  sanitize:
+    name: ASan / UBSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang pkg-config libncurses-dev python3
+      - name: Build and test with sanitizers
+        run: |
+          mkdir -p build
+          make CC=clang sanitize 2>&1 | tee build/sanitize.log
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: diagnostics-sanitizers
+          path: |
+            build/sanitize.log
+            build/pty-failure.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  package:
+    name: Install and package / Linux x86_64
+    needs: [build, sanitize]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      CC: gcc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils git pkg-config libncurses-dev python3
+      - name: Check scripts
+        run: |
+          bash -n install.sh
+          python3 -m compileall -q scripts tests
+      - name: Test installation and upgrades
+        run: make test-install
+      - name: Test distribution archive
+        run: make test-package
+      - name: Build distribution archive
+        run: make package
+      - name: Upload Linux bundle and checksum
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: porttop-linux-x86_64
+          path: |
+            build/dist/*.tar.gz
+            build/dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: diagnostics-install-package
+          path: |
+            build/install-test.log
+            build/package-test.log
+          if-no-files-found: ignore
+          retention-days: 7

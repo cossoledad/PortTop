@@ -2,13 +2,26 @@
 
 **Ports first. Processes in context.**
 
-面向本地微服务开发的 Linux 终端进程监视器，使用 C11 和 ncursesw 编写。先找到端口，再查看占用它的进程、启动参数和启动链，在确认影响范围后终止进程或服务子树。布局与键盘操作参考 [btop](https://github.com/aristocratos/btop)，实现独立。
+**English** | [简体中文](README.zh-CN.md)
 
-当前版本 **0.4.0**。默认展示 TCP 监听端口和未连接的 UDP socket，按本地端口升序排列。同一端口的不同协议、地址及进程拥有者分别展示。
+[![CI](https://github.com/cossoledad/PortTop/actions/workflows/ci.yml/badge.svg)](https://github.com/cossoledad/PortTop/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Platform: Linux](https://img.shields.io/badge/platform-Linux-informational.svg)
 
-## 编译运行
+A terminal monitor for local development: find a port, inspect its process, and stop the right service—even when a launcher or supervisor sits in between. Written in C with ncursesw, with an interface inspired by [btop](https://github.com/aristocratos/btop).
 
-推荐使用安装脚本，默认安装到当前用户的 `~/.local/bin`，不需要 sudo；需要 Linux、C11 编译器、Make 和 ncursesw 开发包。
+![PortTop showing port ownership, CPU and memory histories, and process details](docs/assets/porttop.png)
+
+*A local demo service under load.*
+
+- **Start with a port.** TCP/UDP, IPv4/IPv6, filtering and sorting.
+- **See the context.** Commands, working directories, parent chains and scrollable process details.
+- **Watch the load.** CPU and memory histories, per-core meters and selected-process overlays.
+- **Stop with a preview.** Confirm termination of a process or a reviewed subtree. Your processes by default; all visible users when run as root.
+
+## Install
+
+On Ubuntu, install the build dependencies, then install PortTop for your user:
 
 ```sh
 sudo apt install git build-essential pkg-config libncursesw5-dev
@@ -19,127 +32,31 @@ export PATH="$HOME/.local/bin:$PATH"
 porttop
 ```
 
-脚本会提示 PATH 设置方法，不修改 shell 配置。将上述 export 行加入 `~/.bashrc` 或 `~/.zshrc` 可持久生效。保留源码目录以供升级：
+Keep the checkout for upgrades with `porttop-update`. Uninstall with `./install.sh --uninstall`. See the [installation guide](docs/install.en.md) for custom paths and details.
+
+Linux with `/proc` and ncursesw is required; Linux 5.3+ enables pidfd-based termination. Use a terminal of at least 80 × 24, preferably 120 × 36.
+
+## Use
 
 ```sh
-porttop-update                       # 拉取当前分支上游并重建
-# 或在源码目录运行：
-./install.sh --upgrade
-./install.sh --uninstall             # 卸载安装脚本创建的程序及升级入口
+porttop --port 18080       # Find a local port
+porttop --filter python    # Filter by command, PID, user or address
+porttop --json             # Export a snapshot
 ```
 
-升级要求 Git 工作区干净且能快进更新；不会覆盖本地修改。每次使用独立临时目录构建，成功后替换完整二进制；构建失败保留已安装版本。卸载会校验文件哈希，文件被手动替换时拒绝删除。源码包用户下载新版后重新执行 `./install.sh` 即可更新，无需 Git 拉取。
-
-更多选项见 [安装、升级与卸载](docs/install.md)。开发时可直接 `make && ./build/porttop`；`make install` 默认前缀也为 `~/.local`，是只安装二进制的底层入口，不创建升级助手。
-
-终端至少 80 × 24，建议 120 × 36。使用 terminfo 和 ncurses 适配终端，支持 SSH 和 WSL；需要正确设置 `TERM`。`NO_COLOR=1` 或 `--no-color` 关闭颜色，选中项仍有反色提示。
-
-```sh
-./build/porttop --port 18080       # 精确查看本地端口
-./build/porttop --filter python    # 按命令、PID、用户、地址等筛选
-./build/porttop --all              # 包含已连接的 TCP/UDP socket
-./build/porttop --sort cpu         # CPU 从高到低，需等待两次采样
-./build/porttop --once             # 文本快照
-./build/porttop --json             # JSON 快照
-./build/porttop --help
-```
-
-标准输入或输出不是终端时，自动输出一次文本快照。`--json` 的 stdout 只输出 JSON，进程不可见时 `process` 为 `null`。
-
-自定义目录：`./install.sh --prefix /absolute/path`。显式系统安装：`sudo ./install.sh --system`（默认 `/usr/local/bin`）。
-
-## 操作
-
-| 按键 | 功能 |
+| Key | Action |
 | --- | --- |
-| ↑ / ↓，`j` 向下 | 选择端口及进程；小写 `k` 用于终止 |
-| PgUp / PgDn，Home / End | 翻页、跳转首尾 |
-| `/` | 实时筛选；Enter 应用，Esc 取消编辑 |
-| Esc | 清除已应用的筛选（命令行 `--port` 仍生效） |
-| `s` / `r` | 切换端口、PID、CPU、RSS 排序 / 反转排序 |
-| `a` | 切换默认服务视图与全部 socket |
-| Space / `R` | 暂停采样 / 立即刷新 |
-| `c` | 翻到下一页逻辑核实时仪表 |
-| `g` | 切换进程独立刻度 / 与整机统一刻度 |
-| Enter / `i` | 打开选中进程的独立详情弹窗 |
-| `k` | 打开 SIGTERM 终止弹窗，`t` 保留为别名 |
-| `K` | 打开 SIGKILL 强制终止弹窗 |
-| `?` / `q` | 帮助 / 退出 |
+| ↑ / ↓ | Select a port and process |
+| `/` · `s` | Filter · change sort order |
+| Enter / `i` | Inspect process details; scroll with the mouse or keyboard |
+| `k` · `K` | Confirm SIGTERM · SIGKILL; choose a parent or subtree in the dialog |
+| `c` · `g` | Page CPU cores · switch graph scales |
+| Space · `?` · `q` | Pause · help · quit |
 
-## 进程详情弹窗
+See the [usage guide](docs/usage.md) for all controls, graph scales and process-tree behavior.
 
-在端口行按 **Enter 或 `i`** 打开只读详情。首选尺寸固定为 **110 列 × 28 行**，不随命令长度变化；终端不足时缩至可用区域。内容自动换行，右侧滚动条和顶部行号显示当前位置。
+## Contribute
 
-- **鼠标滚轮**：每次滚动三行，仅对弹窗内部生效；滚到首尾会停止。
-- **↑ / ↓ / `j`**：逐行；**PgUp / PgDn**：翻页；**Home / End**：跳到首尾。
-- **Esc、`q`、`i` 或 Enter**：关闭并返回原界面。
+Bug reports and contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing and project internals.
 
-包含 PID/PPID、用户和 UID、CPU/RSS、进程状态、完整 CMD（采集上限 16 KiB，有截断提示）、工作目录、可执行文件、PGID/session/TTY、启动 ticks、当前采集模式中的该进程所有可见端口，以及启动链中的命令。下方摘要里的路径省略不影响弹窗中的原始内容。
-
-打开时保存快照并暂停后台采样，进程退出后仍保留正在阅读的对象；关闭后恢复原来的暂停或确认状态。详情窗内不执行终止快捷键。终止确认窗中按 `i`，可查看当前选中的父进程详情，再返回原确认范围。
-
-鼠标通过终端的鼠标报告协议工作；不支持的终端可使用上述键盘操作。退出弹窗或程序时恢复鼠标状态。原 `[` / `]` 命令分段操作已移除。
-
-## CPU、内存与进程曲线
-
-上方用带边框的独立面板展示 CPU 和内存；CPU 面板内并排放置历史图与逻辑核仪表。UTF-8 终端采用圆角边框和双列 Braille 点阵，每个字符容纳两个采样点；系统曲线使用渐层填充，选中进程使用紫色连线，图例 `* PID` 标识对象。淡刻度线标出系统的 0/50/100%（紧凑模式为 0/100%），标题中的秒数表示当前可见历史跨度。单元格同时含系统与进程时使用进程曲线颜色。`LC_ALL=C` 下回退为 ASCII 图形，无颜色终端仍可区分曲线和选中行。按 `c` 翻页查看所有逻辑核。
-
-- 系统 CPU 图为所有核的平均占用率（0–100%）。每核仪表也为 0–100%。进程 CPU 数字遵循 top：一个核为 100%，多线程可以超过 100%。默认叠加曲线采用进程独立刻度：CPU 上限从 100% 开始按倍数扩展，图例显示当前上限，便于看清低负载服务。按 `g` 切换到整机统一刻度，此时进程 CPU 除以采样时的核数。
-- 系统内存按 `MemTotal − MemAvailable` 计算。进程内存是 RSS，默认叠加刻度从 32 MiB 开始按倍数扩展，标题与图例显示 RSS 和刻度上限。统一刻度模式下叠加值为 RSS / 系统内存。
-- 保存最近 240 次成功采样，按终端宽度显示最近一段；每列最多容纳两次采样，邻近有效进程点之间连接，缺失样本保留断点。每个进程按 PID + 启动时间独立保存。独立刻度按保留历史中的峰值确定，随图例明确展示；选择另一个端口或进程后，立即显示对应历史；没有数据时留空，不拼接其他进程曲线。
-- 首次 CPU 差分尚未建立时不画进程 CPU 点。暂停、详情/终止弹窗和采集失败不增加历史点；横轴表示采样序列，不是墙钟秒数。CPU 热插拔按核 ID 匹配前一帧，新核先留空。
-
-中间的端口面板采用对齐列、低饱和选中底色和独立状态颜色。窄窗口隐藏冗余的 USER 列，把空间留给端口和命令；列表中的命令缩短首个可执行路径，详情保留实际 cmdline。下方详情采用标签/值对齐，长路径和父链中间省略以保留首尾，完整命令通过 Enter / `i` 弹窗自动换行浏览。80 × 24 使用压缩图表与详情，32 行以上显示完整详情。启动链最多包含拥有者及 11 级祖先进程，在受保护的祖先或有终端的会话首进程处停止。
-
-## 脚本启动多个服务 / 服务被自动拉起
-
-例如 `launcher → supervisor → server:18080`，只杀 server 可能会触发 supervisor 重启它。在端口行按 `k` 后：
-
-1. 默认目标是端口拥有者，范围是 **Process only**，弹窗默认焦点为 **Cancel**。
-2. 在弹窗中按 ↑ 逐级选择父进程，按 ↓ 返回子进程。选择父进程时默认切换到 **Subtree**，可按 `s` 切换为仅此进程。
-3. 检查目标命令及受影响的进程和可见端口；按 `i` 打开目标详情浏览长命令。列表包含不监听端口的后代；滚轮及 PgUp / PgDn 滚动预览。选 supervisor 会影响它管理的其他服务，选 launcher 则会影响其整个子树。
-4. Tab 或左右键选择 **Terminate**，Enter 执行；也可按 `y` 确认。Esc、`n`、`q` 或在 Cancel 上按 Enter 均取消。
-
-确认期间冻结快照、目标身份和弹窗位置。每个目标使用 pidfd 和启动时间验证，拒绝 PID 1、自身和自身祖先；所有目标通过预检后才开始发送。子树按父进程在前的顺序逐个发送，不使用进程组 kill。报告区分成功发送、已退出及失败；发送成功不等于退出成功。
-
-子树是预览时捕获的**有限集合**，不是原子服务停止事务。新派生进程、已经脱离父子关系的进程，以及树外的 systemd 等监督者不在集合内。无法仅凭通用 `/proc` 信息暂停某个 supervisor 的单项重启策略；如需保留其余受管服务，应通过该 supervisor 自身提供的控制接口操作。
-
-## 刷新稳定性
-
-界面按 `docs/image` 中的参考调整面板、配色与信息层级；终止弹窗保持默认 Cancel，背景变暗，确认 Terminate 时使用醒目的危险色。底部以键名和动作分色展示常用操作。
-
-主界面与弹窗先绘制到 ncurses 虚拟屏幕，再通过一次 `doupdate()` 提交差异，不在采样时反复清空物理屏幕。固定分区尺寸和数字列宽；有数据、输入或尺寸变化才更新。按 socket inode、PID、启动时间保留选中对象，并尽量保留它所在的屏幕行，减少前面端口增减时的跳动。窗口大小改变时重新布局，弹窗会保持居中；尺寸过小时暂停可见确认操作。
-
-## 权限与数据边界
-
-默认按有效 UID 选择可见范围：普通用户仅显示归属自身 UID、能识别拥有者的端口行；其他用户及归属未知的行隐藏。该规则同时用于交互界面、文本和 JSON。`--all` 仅放开 socket 状态，不改变用户范围。
-
-```sh
-porttop                              # 当前用户
-sudo "$HOME/.local/bin/porttop"       # 所有可见用户；使用用户安装的同一个程序
-```
-
-这里的“归属”取 `/proc/<pid>` 目录属主 UID，不是历史启动者追踪；setuid、特权切换等场景可能改变归属。系统 CPU/内存图始终是系统范围，进程过滤不改变系统统计。root 仍受当前 PID/网络 namespace、LSM 和挂载权限约束；无法识别 owner 的 socket 在 root 模式保留为未知。JSON 的 `scope` 和 `viewer_uid` 明示范围；未知 socket 和权限诊断计数基于原始采集结果，可能包含列表中隐藏的行。
-
-- 扫描当前网络 namespace 的 TCP/TCP6/UDP/UDP6。暂不聚合其他网络 namespace，不包含 Unix socket。
-- `/proc` 快照非原子；短命进程和正在关闭的 socket 可能暂时显示未知归属。TIME-WAIT 等 socket 本来也可能没有进程拥有者。子树预览仅包含可读的进程，遇到不可读记录会提示；扫描安全上限为 16,384 个进程，超出则拒绝构造计划。
-- 进程 CPU 以一个逻辑核为 100%，多线程可以超过 100%；第一帧为 0。RSS 在多个端口行重复展示，不能相加。系统 CPU 基于 `/proc/stat`，系统内存使用 Total − Available。
-- 命令来源于 `/proc/<pid>/cmdline`，按空格连接 argv，**不是可以无损重新执行的 shell 命令**。最多读取 16 KiB，达到上限明确标记截断；详情弹窗自动换行，并支持滚轮和翻页键。脚本原始文本和已经被 exec 替换的历史命令无法恢复。
-- 当前用户文本与 JSON 使用 ASCII 安全文本：控制字符和非 ASCII 字节替换为 `?`；完整 Unicode 文本展示待支持。
-- 内核或编译环境不支持 pidfd 时仅监视，操作失败显示原因。建议 Linux 5.3+。没有自动提权或自动终止父进程的行为。
-
-## 开发与验证
-
-```sh
-make test        # 核心检查 + 真实 socket、进程树、PTY 交互验收
-make test-install # 隔离用户目录与本地 Git remote 验证安装、升级、失败保留及卸载
-make sanitize    # ASan / UBSan 下运行相同检查（会清理普通构建）
-make clean
-make             # 恢复普通构建
-```
-
-安装测试不修改真实用户目录或访问远程网络。进程测试仅终止其自行创建的进程。覆盖重启服务的 supervisor、多服务 launcher、无端口后代、兄弟服务隔离、子树身份预检及刷新稳定性。IPv6 不可用时跳过 IPv6 socket 创建；当前 Ubuntu / WSL2 环境已实际覆盖 IPv6。
-
-详见 [架构说明](docs/architecture.md) 和 [验证记录](docs/validation.md)。后续方向：可折叠端口分组与服务标记、完整 Unicode、主题与鼠标操作、namespace 支持，以及大规模进程场景的采集性能测量。
-
-MIT License，见 [LICENSE](LICENSE)。
+Released under the [MIT License](LICENSE).

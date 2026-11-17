@@ -7,10 +7,11 @@ CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Wformat=2 -Wshadow -Wconversion
 LDFLAGS ?=
 PREFIX ?= $(HOME)/.local
 BUILD_DIR ?= build
+DIST_DIR ?= build/dist
 SOURCES = src/main.c src/proc.c src/actions.c src/history.c src/text_view.c src/ui.c
 OBJECTS = $(SOURCES:src/%.c=$(BUILD_DIR)/%.o)
 
-.PHONY: all clean test test-install sanitize install uninstall
+.PHONY: all clean test test-install test-package package sanitize install uninstall
 all: $(BUILD_DIR)/porttop
 $(BUILD_DIR):
 	mkdir -p $@
@@ -24,11 +25,15 @@ test: all $(BUILD_DIR)/test-core
 	./$(BUILD_DIR)/test-core
 	python3 tests/integration.py ./$(BUILD_DIR)/porttop
 test-install:
+	mkdir -p build
 	python3 tests/install.py
+test-package:
+	python3 tests/package.py
+package:
+	python3 scripts/package.py --output "$(DIST_DIR)"
 sanitize:
-	$(MAKE) clean
-	$(MAKE) CFLAGS='-O1 -g -std=c11 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined'
-	ASAN_OPTIONS=detect_leaks=1 $(MAKE) CFLAGS='-O1 -g -std=c11 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined' test
+	$(MAKE) BUILD_DIR=build/asan clean
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 $(MAKE) BUILD_DIR=build/asan CFLAGS='-O1 -g -std=c11 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined' test
 install: all
 	install -Dm755 "$(BUILD_DIR)/porttop" "$(DESTDIR)$(PREFIX)/bin/porttop"
 uninstall:

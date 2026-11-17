@@ -1,5 +1,13 @@
 # 验证记录
 
+## 文档、CI 与分发准备（2026-11-17）
+
+本地环境仍为 Ubuntu 26.04.1 LTS / x86_64，普通用户执行。GCC 与 Clang 分别在独立构建目录以严格告警和 `-Werror` 编译，完整 `make test` 通过；`make CC=clang sanitize` 在独立 `build/asan` 下通过 ASan / UBSan、leak detection 与相同集成检查，普通构建保持可用。
+
+`make test-install` 通过真实本地 Git 快进升级、失败保留及卸载验收。新增 `make test-package` 在带空格的目录生成归档，核对 SHA-256、归档路径和类型、许可证、二进制身份，解压后实际执行 `--version` 与 `--json`，验证 UID 范围和系统指标，并确认构建不受继承的无效 CFLAGS/LDFLAGS 干扰、不链接 sanitizer runtime。`make package` 已实际生成本地归档及校验文件，清单如实记录本机 glibc 2.43 和未提交源码状态，不代表 Ubuntu 22.04 产物。
+
+actionlint 1.7.12、Bash 语法、Python 编译检查、Markdown 相对链接及图片路径、`git diff --check` 均通过。配置覆盖 Ubuntu 22.04 / 24.04 的 GCC / Clang，当前尚未推送并运行 GitHub 托管 CI，因此不将配置矩阵视为这些系统上已经通过的验收。未发布 Release，也未验证其他发行版、aarch64 或包管理器分发格式。
+
 ## 0.4.0：详情视口和图表（2026-11-17）
 
 `make test`、独立 `build/asan` 的 ASan/UBSan + leak detection，以及隔离安装/升级验收通过。新增 TextView 核心检查：5000 字符长单词和带空格/百分号的文本换行后不丢字节，resize 保留字节锚点，极端滚动增量和首尾夹紧正确。

@@ -1,5 +1,7 @@
 # 安装、升级与卸载
 
+[English](install.en.md) | **简体中文** · [返回首页](../README.zh-CN.md)
+
 推荐从源码克隆后使用 `install.sh`。仅运行安装步骤不需要 sudo，默认安装到 `~/.local/bin`。编译依赖包括 C11 编译器、Make、ncursesw；安装脚本还使用 Bash 和 coreutils。Git 仅用于从 Git 仓库升级。
 
 ## Ubuntu 用户安装

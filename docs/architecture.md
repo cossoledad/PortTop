@@ -1,6 +1,6 @@
 # 架构与实现边界
 
-入口为 `README.md`。当前只有一套 C11 / Linux 实现，运行时依赖 libc、ncursesw / terminfo，不调用外部命令。
+用户入口为 [英文首页](../README.md) / [中文首页](../README.zh-CN.md)，开发入口为 [开发指南](development.md)。当前只有一套 C11 / Linux 实现，运行时依赖 libc、ncursesw / terminfo，不调用外部命令。
 
 | 文件 | 职责 |
 | --- | --- |
@@ -16,6 +16,8 @@
 | `tests/vt.py` | 测试用增量 UTF-8 VT 屏幕模型，解析 ncurses 差分输出 |
 | `tests/fixture.py` | 多协议、共享 FD、fork 测试服务 |
 | `install.sh` / `tests/install.py` | 用户安装、显式快进升级、卸载与隔离验收 |
+| `scripts/package.py` / `tests/package.py` | 原生 Linux 归档、构建清单、校验和与解压运行验收 |
+| `.github/workflows/ci.yml` | 编译器/Ubuntu 矩阵、sanitizer、安装与打包 CI，保留产物但不发布 |
 | `tests/load_fixture.py` | 可控 RSS 增长和 CPU 负载，用于实际图表变化验收 |
 | `tests/supervisor_fixture.py` | launcher、重启 supervisor、服务、无端口 worker 和兄弟服务 |
 
