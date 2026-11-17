@@ -20,7 +20,7 @@ static void usage(FILE *f) {
         "      --no-color         Disable terminal colors\n"
         "  -h, --help             Show help\n"
         "  -v, --version          Show version\n\n"
-        "Keys: arrows move, j down, / filter, s sort, r reverse, a all sockets,\n"
+        "Keys: Enter/i process details (wheel/arrows scroll), arrows move, j down, / filter, s sort, r reverse, a all sockets,\n"
         "      Space pause, c CPU core page, g graph scale, k SIGTERM, K SIGKILL (popup supports parents/subtrees), ? help, q quit.\n"
         "Default: current user only; root sees all visible owners. TCP listeners + UDP.\n", PT_VERSION);
 }

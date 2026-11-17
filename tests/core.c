@@ -1,5 +1,7 @@
 #include "porttop.h"
+#include "text_view.h"
 #include <assert.h>
+#include <limits.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <signal.h>
@@ -36,7 +38,29 @@ static void check_history(void) {
     assert(process_visible(&owned,0) && process_visible(&other,0) && process_visible(NULL,0));
 }
 
+static void check_text_view(void) {
+    TextView view={0}; char token[5001]; memset(token,'x',sizeof(token)-1); token[5000]=0;
+    assert(text_view_append(&view,"[ COMMAND ]\n%s\n\nargv with spaces and 100%%%% literal\nTAIL_MARKER",token)==0);
+    assert(text_view_wrap(&view,69)==0 && view.count>70);
+    char *joined=malloc(view.length+1),*expected=malloc(view.length+1); assert(joined && expected);
+    size_t length=0,flat=0;
+    for (size_t i=0;i<view.count;i++) {
+        assert(view.lines[i].length<=69);
+        memcpy(joined+length,view.text+view.lines[i].start,view.lines[i].length); length+=view.lines[i].length;
+    }
+    for (size_t i=0;i<view.length;i++) if (view.text[i]!='\n') expected[flat++]=view.text[i];
+    assert(length==flat && !memcmp(joined,expected,length)); free(joined); free(expected);
+    view.scroll=25; size_t anchor=view.lines[view.scroll].start;
+    assert(text_view_wrap(&view,40)==0 && view.lines[view.scroll].start<=anchor);
+    assert(view.scroll+1==view.count || view.lines[view.scroll+1].start>anchor);
+    text_view_move(&view,LONG_MAX,10); assert(view.scroll==view.count-10);
+    text_view_move(&view,LONG_MIN,10); assert(view.scroll==0);
+    assert(text_view_wrap(&view,0)<0);
+    text_view_free(&view);
+}
+
 int main(void) {
+    check_text_view();
     check_history();
     Process p;
     assert(prctl(PR_SET_NAME,"pt (odd) name",0,0,0)==0);
@@ -105,6 +129,6 @@ int main(void) {
     }
     assert(measured);
     snapshot_free(&first); snapshot_free(&second); close(listener);
-    puts("PASS core: process stat parsing, identity checks, pidfd signals, terminal text, live per-core sampling, history ring and UID scope, subtree preflight and ancestor protection");
+    puts("PASS core: process stat parsing, identity checks, pidfd signals, terminal text, live per-core sampling, history ring and UID scope, wrapped details, subtree preflight and ancestor protection");
     return 0;
 }

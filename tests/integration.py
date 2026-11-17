@@ -66,6 +66,18 @@ class Terminal:
                 block = os.read(self.master, 65536)
                 self.data += block
                 self.screen.feed(block)
+    def wheel(self, down=True, x=25, y=10):
+        self.send(f"\x1b[<{65 if down else 64};{x+1};{y+1}M".encode())
+    def info_progress(self):
+        line = next(line for line in self.screen.text.splitlines() if "PROCESS INFORMATION" in line)
+        return tuple(map(int, re.search(r"(\d+)-(\d+) / (\d+)", line).groups()))
+    def info_bounds(self):
+        lines = self.screen.text.splitlines()
+        top = next(i for i, line in enumerate(lines) if "PROCESS INFORMATION" in line)
+        title = lines[top].index("PROCESS INFORMATION")
+        left, right = lines[top].rfind("╭", 0, title), lines[top].find("╮", title)
+        bottom = next(i for i in range(top+1, len(lines)) if lines[i][left]=="╰" and lines[i][right]=="╯")
+        return left, top, right-left+1, bottom-top+1
     def clear(self):
         self.data = b""
     def resize(self, height, width):
@@ -174,10 +186,14 @@ try:
     term.clear()
     term.send(b"k")
     term.until(b"TERMINATE PROCESS")
-    term.send(b"]")
-    term.until(b"COMMAND [106/")
-    term.send(b"[")
-    term.until(b"COMMAND [0/")
+    term.send(b"i")
+    term.until(b"PROCESS INFORMATION")
+    term.until(b"fixture.py")
+    term.send(b"\x1bOF")
+    term.until(b"END OF DETAILS")
+    term.send(b"\x1b")
+    term.drain(.1)
+    term.until(b"TERMINATE PROCESS")
     term.resize(16, 60)
     term.until(b"terminal too small")
     term.send(b"y") # confirmation must be disabled when popup controls are hidden
@@ -413,3 +429,111 @@ for locale, color in [("C.UTF-8", True), ("C", False)]:
     finally:
         term.close()
 print("PASS presentation: framed panels, 80/107/130 columns, UTF-8 and ASCII, color and monochrome")
+
+# A long real argv must be wrapped, fully reachable and safe in a fixed modal.
+long_command = " ".join(f"DETAIL_ARG_{i:04d}" for i in range(320)) + " DETAIL_CMD_TAIL"
+for locale in ["C.UTF-8", "C"]:
+    service = subprocess.Popen([sys.executable, str(ROOT / "tests/detail_fixture.py"), long_command],
+                               stdout=subprocess.PIPE, text=True, start_new_session=True)
+    term = None
+    try:
+        assert select.select([service.stdout], [], [], 5)[0]
+        detail_port = json.loads(service.stdout.readline())["port"]
+        term = Terminal("-p", detail_port, "-i", 100, locale=locale)
+        term.until(b"PROCESS DETAILS")
+        term.send(b"\r")
+        term.until(b"PROCESS INFORMATION")
+        term.until(b"read-only snapshot")
+        term.until(b"DETAIL_ARG_0000")
+        term.drain(.1)
+        before = term.info_progress()
+        if locale != "C": bounds = term.info_bounds()
+        assert b"1006" in term.data and b"1000h" in term.data, "mouse reporting was not enabled"
+        frozen = term.screen.text
+        term.drain(.3)
+        assert term.screen.text == frozen, "detail snapshot must not move while reading"
+        term.wheel(x=0,y=0) # outside the popup must not scroll the background or details
+        term.drain(.1)
+        assert term.info_progress() == before
+        term.wheel()
+        term.drain(.1)
+        assert term.info_progress()[0] == before[0]+3
+        term.wheel(down=False)
+        term.drain(.1)
+        assert term.info_progress()[0] == before[0]
+        # Actual wheel events traverse the command until its final argv bytes appear.
+        for _ in range(60):
+            if "DETAIL_CMD_TAIL" in term.screen.text: break
+            term.wheel(); term.drain(.02)
+        term.until(b"DETAIL_CMD_TAIL")
+        if locale != "C": assert term.info_bounds() == bounds
+        term.send(b"\x1bOF")
+        term.until(b"END OF DETAILS")
+        end = term.info_progress()
+        for _ in range(3): term.wheel()
+        term.drain(.1)
+        assert term.info_progress() == end, "wheel must stop at document end"
+        term.send(b"\x1bOH")
+        term.until(b"DETAIL_ARG_0000")
+        assert term.info_progress()[0] == 1
+        term.send(b"\x1b[6~")
+        term.drain(.1)
+        assert term.info_progress()[0] > 1
+        if locale != "C":
+            term.resize(44, 150); term.drain(.3)
+            assert term.info_bounds()[2:] == bounds[2:], "larger terminals must not enlarge the modal"
+            term.resize(24, 80); term.drain(.3)
+            assert term.info_bounds()[2:] == (76,22)
+            term.send(b"\x1bOF"); term.until(b"END OF DETAILS")
+            term.resize(16,60); term.until(b"terminal too small")
+            term.resize(36,130); term.drain(.3); term.until(b"PROCESS INFORMATION")
+        if locale == "C.UTF-8":
+            term.drain(.1)
+            term.process.send_signal(signal.SIGTSTP)
+            deadline = time.monotonic()+5
+            while time.monotonic()<deadline:
+                stopped,status = os.waitpid(term.process.pid, os.WUNTRACED | os.WNOHANG)
+                if stopped:
+                    assert os.WIFSTOPPED(status)
+                    break
+                term.drain(.02)
+            else: raise AssertionError("details suspend timed out")
+            assert termios.tcgetattr(term.slave) == term.original
+            term.clear()
+            term.process.send_signal(signal.SIGCONT)
+            term.drain(.3)
+            assert b"1000h" in term.data, "mouse mode must resume with the viewer"
+            term.send(b"\x1bOH"); term.until(b"DETAIL_ARG_0000")
+            term.wheel(); term.drain(.1)
+            assert term.info_progress()[0] == 4
+        term.send(b"ky") # read-only: these cannot open or confirm a kill
+        term.drain(.1)
+        assert service.poll() is None and "PROCESS INFORMATION" in term.screen.text
+        service.terminate(); service.wait(timeout=5)
+        term.drain(.15)
+        assert "PROCESS INFORMATION" in term.screen.text, "exited PID must not replace the captured detail identity"
+        term.send(b"\x1b"); term.drain(.3)
+        term.until(b"No matching ports")
+        assert "PROCESS INFORMATION" not in term.screen.text
+        assert b"1000l" in term.data, "mouse capture must be released on close"
+        term.close(); term = None
+    finally:
+        if term: term.close(external=True)
+        if service.poll() is None: service.terminate()
+        service.wait(timeout=5)
+print("PASS info: Enter/i, full long argv, real mouse wheel, page/home/end, fixed geometry, resize, snapshot identity, read-only safety, ASCII fallback")
+
+service = subprocess.Popen([sys.executable, str(ROOT / "tests/detail_fixture.py")], stdout=subprocess.PIPE, text=True)
+term = None
+try:
+    assert select.select([service.stdout], [], [], 5)[0]
+    port = json.loads(service.stdout.readline())["port"]
+    term = Terminal("-p", port)
+    term.until(b"PROCESS DETAILS"); term.send(b"i"); term.until(b"PROCESS INFORMATION")
+    term.process.terminate(); assert term.process.wait(timeout=5) == 0
+    term.drain(.1)
+    assert b"1000l" in term.data, "external termination must release mouse mode"
+    term.close(); term = None
+finally:
+    if term: term.close(external=True)
+    service.terminate(); service.wait(timeout=5)

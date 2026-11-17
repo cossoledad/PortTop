@@ -7,7 +7,7 @@ CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Wformat=2 -Wshadow -Wconversion
 LDFLAGS ?=
 PREFIX ?= $(HOME)/.local
 BUILD_DIR ?= build
-SOURCES = src/main.c src/proc.c src/actions.c src/history.c src/ui.c
+SOURCES = src/main.c src/proc.c src/actions.c src/history.c src/text_view.c src/ui.c
 OBJECTS = $(SOURCES:src/%.c=$(BUILD_DIR)/%.o)
 
 .PHONY: all clean test test-install sanitize install uninstall
@@ -18,8 +18,8 @@ $(BUILD_DIR)/%.o: src/%.c src/porttop.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 $(BUILD_DIR)/porttop: $(OBJECTS)
 	$(CC) $(LDFLAGS) $^ $(CURSES_LIBS) -o $@
-$(BUILD_DIR)/test-core: tests/core.c $(BUILD_DIR)/proc.o $(BUILD_DIR)/actions.o $(BUILD_DIR)/history.o src/porttop.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/core.c $(BUILD_DIR)/proc.o $(BUILD_DIR)/actions.o $(BUILD_DIR)/history.o -o $@
+$(BUILD_DIR)/test-core: tests/core.c $(BUILD_DIR)/proc.o $(BUILD_DIR)/actions.o $(BUILD_DIR)/history.o $(BUILD_DIR)/text_view.o src/porttop.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/core.c $(BUILD_DIR)/proc.o $(BUILD_DIR)/actions.o $(BUILD_DIR)/history.o $(BUILD_DIR)/text_view.o -o $@
 test: all $(BUILD_DIR)/test-core
 	./$(BUILD_DIR)/test-core
 	python3 tests/integration.py ./$(BUILD_DIR)/porttop

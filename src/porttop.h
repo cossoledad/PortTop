@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-#define PT_VERSION "0.3.0"
+#define PT_VERSION "0.4.0"
 #define PT_COMMAND 16384
 
 typedef struct {
